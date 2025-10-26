@@ -1,567 +1,565 @@
+"""
+Integrated RAG-based Terraform Generation System with Validation Feedback Loop
+Complete system with generator and validator in one file.
+"""
+
 import os
-import json
-import requests
 from typing import List, Dict, Optional
-from dataclasses import dataclass
+import google.generativeai as genai
+from pinecone import Pinecone
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
+import pathlib
+import shutil
+import subprocess
+import json
 import re
-import time
 
 load_dotenv()
 
-# LangChain imports
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_classic.chains import LLMChain
-from langchain_classic.prompts import PromptTemplate
-from langchain_core.documents import Document
+# ---------------------------
+# Environment Variables
+# ---------------------------
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+INDEX_NAME = "terraform-iac-v1"
 
-@dataclass
-class TerraformExample:
-    """Represents a Terraform code example"""
-    resource_type: str
-    service: str
-    code: str
-    description: str
-    tags: List[str]
-    source_url: str = ""
+# Initialize APIs
+genai.configure(api_key=GEMINI_API_KEY)
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(INDEX_NAME)
+embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 
-class ImprovedTerraformScraper:
-    """Improved scraper with better error handling and alternative sources"""
+# ============================================================================
+# VALIDATOR AGENT
+# ============================================================================
+
+class TerraformValidator:
+    """Comprehensive Terraform code validator"""
     
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        self.github_token = os.getenv("GITHUB_TOKEN")
+    def __init__(self, terraform_file: str):
+        self.terraform_file = pathlib.Path(terraform_file)
+        self.terraform_dir = self.terraform_file.parent
+        self.validation_results = {
+            "syntax_check": {},
+            "security_check": {},
+            "llm_review": {},
+            "overall_status": "PENDING"
+        }
+    
+    def validate_all(self) -> Dict:
+        """Run all validation checks"""
+        print("\n" + "="*60)
+        print("🔍 TERRAFORM VALIDATION AGENT")
+        print("="*60)
         
-    def fetch_from_terraform_aws_modules(self, module_name: str) -> List[TerraformExample]:
-        """Fetch examples from terraform-aws-modules GitHub (more reliable)"""
-        examples = []
+        # 1. Syntax Validation
+        print("\n[1/4] Running syntax validation...")
+        self.validation_results["syntax_check"] = self._validate_syntax()
         
-        repos = {
-            "vpc": "terraform-aws-modules/terraform-aws-vpc",
-            "s3": "terraform-aws-modules/terraform-aws-s3-bucket",
-            "ec2": "terraform-aws-modules/terraform-aws-ec2-instance",
-            "rds": "terraform-aws-modules/terraform-aws-rds",
-            "lambda": "terraform-aws-modules/terraform-aws-lambda",
-            "alb": "terraform-aws-modules/terraform-aws-alb",
-            "ecs": "terraform-aws-modules/terraform-aws-ecs",
-            "eks": "terraform-aws-modules/terraform-aws-eks",
-            "security-group": "terraform-aws-modules/terraform-aws-security-group"
+        # 2. Security Best Practices
+        print("\n[2/4] Checking security best practices...")
+        self.validation_results["security_check"] = self._check_security()
+        
+        # 3. LLM-based Code Review
+        print("\n[3/4] Running LLM code review...")
+        self.validation_results["llm_review"] = self._llm_code_review()
+        
+        # 4. Generate Overall Status
+        print("\n[4/4] Generating overall assessment...")
+        self._generate_overall_status()
+        
+        # Print Summary
+        self._print_summary()
+        
+        return self.validation_results
+    
+    def _validate_syntax(self) -> Dict:
+        """Validate Terraform syntax using terraform validate"""
+        result = {
+            "status": "UNKNOWN",
+            "message": "",
+            "details": []
         }
         
-        repo = repos.get(module_name.lower())
-        if not repo:
-            print(f"No known module for {module_name}")
-            return examples
-            
-        try:
-            # Try multiple files
-            files_to_check = [
-                "README.md",
-                "examples/complete/main.tf",
-                "examples/simple/main.tf"
-            ]
-            
-            for file_path in files_to_check:
-                url = f"https://raw.githubusercontent.com/{repo}/master/{file_path}"
-                
-                print(f"  Trying: {url}")
-                response = self.session.get(url, timeout=10)
-                
-                if response.status_code == 200:
-                    content = response.text
-                    
-                    # Extract HCL code blocks
-                    if file_path.endswith('.md'):
-                        code_blocks = re.findall(r'```(?:hcl|terraform)?\n(.*?)```', content, re.DOTALL)
-                    else:
-                        code_blocks = [content]
-                    
-                    for idx, code in enumerate(code_blocks):
-                        if len(code) > 50 and ('resource' in code or 'module' in code):
-                            examples.append(TerraformExample(
-                                resource_type=f"aws_{module_name}",
-                                service=module_name.upper(),
-                                code=code[:3000],  # Limit size
-                                description=f"{module_name} example from {file_path}",
-                                tags=["terraform-aws-modules", module_name, "official"],
-                                source_url=f"https://github.com/{repo}/blob/master/{file_path}"
-                            ))
-                    
-                    if examples:
-                        print(f"  ✓ Found {len(code_blocks)} examples in {file_path}")
-                        break
-                        
-                time.sleep(0.5)  # Rate limiting
-                
-        except Exception as e:
-            print(f"  ✗ Error fetching {module_name}: {e}")
-        
-        return examples
-    
-    def fetch_from_github_api(self, query: str, max_results: int = 3) -> List[TerraformExample]:
-        """Fetch using GitHub API with better error handling"""
-        examples = []
+        if not self._is_terraform_installed():
+            result["status"] = "SKIPPED"
+            result["message"] = "Terraform CLI not found. Install Terraform to run syntax validation."
+            return result
         
         try:
-            url = "https://api.github.com/search/code"
-            headers = {'Accept': 'application/vnd.github+json'}
+            # Initialize terraform
+            init_result = subprocess.run(
+                ["terraform", "init", "-backend=false"],
+                cwd=self.terraform_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
             
-            if self.github_token:
-                headers['Authorization'] = f'Bearer {self.github_token}'
-                print("  Using authenticated GitHub API")
-            else:
-                print("  ⚠ Using unauthenticated GitHub API (limited to 10 requests/minute)")
+            # Run terraform validate
+            validate_result = subprocess.run(
+                ["terraform", "validate", "-json"],
+                cwd=self.terraform_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
             
-            params = {
-                'q': f'{query} language:HCL path:/ filename:main.tf',
-                'per_page': max_results
-            }
-            
-            response = self.session.get(url, params=params, headers=headers, timeout=10)
-            
-            if response.status_code == 403:
-                print("  ✗ GitHub API rate limit exceeded")
-                return examples
-            elif response.status_code != 200:
-                print(f"  ✗ GitHub API error: {response.status_code}")
-                return examples
-            
-            data = response.json()
-            items = data.get('items', [])
-            
-            print(f"  Found {len(items)} results")
-            
-            for item in items[:max_results]:
-                try:
-                    # Use API to get content
-                    content_url = item.get('url')
-                    content_response = self.session.get(content_url, headers=headers, timeout=10)
-                    
-                    if content_response.status_code == 200:
-                        import base64
-                        content_data = content_response.json()
-                        code = base64.b64decode(content_data['content']).decode('utf-8')
-                        
-                        # Extract resource type
-                        resource_match = re.search(r'resource\s+"(aws_\w+)"\s+"(\w+)"', code)
-                        if resource_match:
-                            resource_type = resource_match.group(1)
-                            
-                            examples.append(TerraformExample(
-                                resource_type=resource_type,
-                                service=resource_type.split('_')[1].upper(),
-                                code=code[:2000],
-                                description=f"Example from {item['repository']['full_name']}",
-                                tags=["github", resource_type, "community"],
-                                source_url=item['html_url']
-                            ))
-                    
-                    time.sleep(1)  # Rate limiting
-                    
-                except Exception as e:
-                    print(f"  ✗ Error processing item: {e}")
-                    
-        except Exception as e:
-            print(f"  ✗ GitHub search error: {e}")
-        
-        return examples
-    
-    def create_synthetic_examples(self, service: str) -> List[TerraformExample]:
-        """Create basic template examples as fallback"""
-        templates = {
-            "vpc": '''resource "aws_vpc" "main" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-
-  tags = {
-    Name = "${var.project_name}-vpc"
-  }
-}
-
-resource "aws_subnet" "public" {
-  count             = length(var.availability_zones)
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet(var.vpc_cidr, 8, count.index)
-  availability_zone = var.availability_zones[count.index]
-
-  tags = {
-    Name = "${var.project_name}-public-${count.index + 1}"
-  }
-}''',
-            "s3": '''resource "aws_s3_bucket" "main" {
-  bucket = var.bucket_name
-
-  tags = {
-    Name = var.bucket_name
-  }
-}
-
-resource "aws_s3_bucket_versioning" "main" {
-  bucket = aws_s3_bucket.main.id
-
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "main" {
-  bucket = aws_s3_bucket.main.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}''',
-            "ec2": '''resource "aws_instance" "main" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
-  subnet_id     = var.subnet_id
-
-  vpc_security_group_ids = [aws_security_group.main.id]
-
-  root_block_device {
-    volume_size = var.root_volume_size
-    encrypted   = true
-  }
-
-  tags = {
-    Name = "${var.project_name}-instance"
-  }
-}
-
-resource "aws_security_group" "main" {
-  name_prefix = "${var.project_name}-"
-  vpc_id      = var.vpc_id
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.admin_cidr]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}''',
-            "rds": '''resource "aws_db_instance" "main" {
-  identifier             = var.db_identifier
-  engine                 = var.db_engine
-  engine_version         = var.db_engine_version
-  instance_class         = var.db_instance_class
-  allocated_storage      = var.db_allocated_storage
-  storage_encrypted      = true
-  
-  db_name  = var.db_name
-  username = var.db_username
-  password = var.db_password
-
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.db.id]
-
-  backup_retention_period = 7
-  skip_final_snapshot     = false
-  final_snapshot_identifier = "${var.db_identifier}-final"
-
-  tags = {
-    Name = var.db_identifier
-  }
-}''',
-            "lambda": '''resource "aws_lambda_function" "main" {
-  filename      = var.lambda_zip_path
-  function_name = var.function_name
-  role          = aws_iam_role.lambda.arn
-  handler       = var.handler
-  runtime       = var.runtime
-
-  source_code_hash = filebase64sha256(var.lambda_zip_path)
-
-  environment {
-    variables = var.environment_variables
-  }
-
-  tags = {
-    Name = var.function_name
-  }
-}
-
-resource "aws_iam_role" "lambda" {
-  name = "${var.function_name}-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "lambda.amazonaws.com"
-      }
-    }]
-  })
-}'''
-        }
-        
-        examples = []
-        if service.lower() in templates:
-            examples.append(TerraformExample(
-                resource_type=f"aws_{service.lower()}",
-                service=service.upper(),
-                code=templates[service.lower()],
-                description=f"Template example for {service}",
-                tags=["template", service.lower(), "baseline"],
-                source_url="built-in"
-            ))
-        
-        return examples
-
-
-class TerraformRAG:
-    """RAG system for generating Terraform code"""
-    
-    def __init__(self, gemini_api_key: str, collection_name: str = "terraform_examples", 
-                 embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-                 persist_directory: str = "./chroma_db"):
-        
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash-exp",
-            google_api_key=gemini_api_key,
-            temperature=0.3,
-            convert_system_message_to_human=True
-        )
-        
-        print(f"Loading embedding model: {embedding_model}")
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=embedding_model,
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
-        )
-        
-        self.persist_directory = persist_directory
-        self.collection_name = collection_name
-        
-        # Load existing or create new
-        if os.path.exists(persist_directory):
             try:
-                self.vectorstore = Chroma(
-                    collection_name=collection_name,
-                    embedding_function=self.embeddings,
-                    persist_directory=persist_directory
-                )
-                count = self.vectorstore._collection.count()
-                print(f"✓ Loaded {count} existing examples")
-            except Exception as e:
-                print(f"Creating new vector store: {e}")
-                self.vectorstore = None
-        else:
-            self.vectorstore = None
-        
-        self.scraper = ImprovedTerraformScraper()
-    
-    def fetch_examples_improved(self, services: List[str], use_templates: bool = True):
-        """Improved fetching with multiple strategies"""
-        all_examples = []
-        
-        print(f"\n{'='*70}")
-        print("FETCHING TERRAFORM EXAMPLES")
-        print(f"{'='*70}\n")
-        
-        for service in services:
-            print(f"\n📦 Fetching {service.upper()} examples:")
-            service_examples = []
-            
-            # Strategy 1: Official terraform-aws-modules
-            print("  [1/3] Trying terraform-aws-modules...")
-            module_examples = self.scraper.fetch_from_terraform_aws_modules(service)
-            service_examples.extend(module_examples)
-            
-            # Strategy 2: GitHub search (if token available)
-            if self.scraper.github_token:
-                print("  [2/3] Searching GitHub...")
-                github_examples = self.scraper.fetch_from_github_api(f"aws {service}", max_results=2)
-                service_examples.extend(github_examples)
-            else:
-                print("  [2/3] Skipping GitHub search (no token)")
-            
-            # Strategy 3: Template fallback
-            if use_templates and len(service_examples) < 2:
-                print("  [3/3] Adding template examples...")
-                template_examples = self.scraper.create_synthetic_examples(service)
-                service_examples.extend(template_examples)
-            
-            print(f"  ✓ Total for {service}: {len(service_examples)} examples\n")
-            all_examples.extend(service_examples)
-        
-        print(f"\n{'='*70}")
-        print(f"TOTAL EXAMPLES FETCHED: {len(all_examples)}")
-        print(f"{'='*70}\n")
-        
-        if all_examples:
-            self.add_terraform_examples(all_examples)
-        else:
-            print("⚠ No examples found. Check your configuration.")
-        
-        return all_examples
-    
-    def add_terraform_examples(self, examples: List[TerraformExample]):
-        """Add examples to vector store"""
-        documents = []
-        
-        for idx, example in enumerate(examples):
-            content = f"""
-Resource Type: {example.resource_type}
-AWS Service: {example.service}
-Description: {example.description}
-Tags: {', '.join(example.tags)}
-Source: {example.source_url}
-
-Terraform Code:
-{example.code}
-            """.strip()
-            
-            doc = Document(
-                page_content=content,
-                metadata={
-                    "resource_type": example.resource_type,
-                    "service": example.service,
-                    "description": example.description,
-                    "tags": ', '.join(example.tags),
-                    "source_url": example.source_url,
-                    "example_id": f"example_{idx}"
-                }
-            )
-            documents.append(doc)
-        
-        print(f"Creating embeddings for {len(documents)} examples...")
-        
-        if self.vectorstore is None:
-            self.vectorstore = Chroma.from_documents(
-                documents=documents,
-                embedding=self.embeddings,
-                collection_name=self.collection_name,
-                persist_directory=self.persist_directory
-            )
-        else:
-            self.vectorstore.add_documents(documents)
-        
-        print(f"✓ Knowledge base updated: {self.vectorstore._collection.count()} total examples")
-    
-    def generate_terraform(self, requirement: str, aws_service: Optional[str] = None, 
-                          n_examples: int = 3) -> Dict[str, str]:
-        """Generate Terraform code using RAG"""
-        
-        if self.vectorstore is None or self.vectorstore._collection.count() == 0:
-            return {
-                "main_tf": "# Error: No examples in knowledge base",
-                "explanation": "Please fetch examples first"
-            }
-        
-        search_query = f"{aws_service} {requirement}" if aws_service else requirement
-        retriever = self.vectorstore.as_retriever(search_kwargs={"k": n_examples})
-        relevant_docs = retriever.invoke(search_query)
-        
-        context = "Relevant Terraform examples:\n\n"
-        for i, doc in enumerate(relevant_docs, 1):
-            context += f"Example {i}:\n{doc.page_content}\n\n"
-        
-        prompt = PromptTemplate(
-            input_variables=["context", "requirement", "aws_service"],
-            template="""You are a Terraform expert. Generate production-ready AWS infrastructure code.
-
-{context}
-
-Requirement: {requirement}
-AWS Service: {aws_service}
-
-Create complete Terraform code with:
-1. main.tf - Resource definitions
-2. variables.tf - Input variables  
-3. outputs.tf - Output values
-4. Brief explanation
-
-Return valid JSON with keys: "main_tf", "variables_tf", "outputs_tf", "explanation"
-JSON only, no markdown."""
-        )
-        
-        chain = LLMChain(llm=self.llm, prompt=prompt)
-        
-        try:
-            response = chain.invoke({
-                "context": context,
-                "requirement": requirement,
-                "aws_service": aws_service or "Not specified"
-            })
-            
-            text = response['text'].strip()
-            text = re.sub(r'^```json\s*', '', text)
-            text = re.sub(r'^```\s*', '', text)
-            text = re.sub(r'\s*```$', '', text)
-            
-            result = json.loads(text)
-            
-        except json.JSONDecodeError:
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                result = json.loads(match.group())
-            else:
-                result = {"main_tf": text, "explanation": "Generated code"}
+                validation_output = json.loads(validate_result.stdout)
+                if validation_output.get("valid", False):
+                    result["status"] = "PASS"
+                    result["message"] = "✅ Terraform syntax is valid"
+                else:
+                    result["status"] = "FAIL"
+                    result["message"] = "❌ Terraform validation failed"
+                    result["details"] = validation_output.get("diagnostics", [])
+            except json.JSONDecodeError:
+                result["status"] = "ERROR"
+                result["message"] = f"Failed to parse terraform output: {validate_result.stdout}"
+                
+        except subprocess.TimeoutExpired:
+            result["status"] = "ERROR"
+            result["message"] = "Terraform validation timed out"
         except Exception as e:
-            result = {"main_tf": f"# Error: {e}", "explanation": str(e)}
+            result["status"] = "ERROR"
+            result["message"] = f"Error during validation: {str(e)}"
         
         return result
+    
+    def _check_security(self) -> Dict:
+        """Check for common security issues"""
+        result = {
+            "status": "PASS",
+            "issues_found": [],
+            "warnings": []
+        }
+        
+        try:
+            terraform_code = self.terraform_file.read_text(encoding="utf-8")
+        except Exception as e:
+            result["status"] = "ERROR"
+            result["issues_found"].append(f"Could not read file: {str(e)}")
+            return result
+        
+        security_patterns = [
+            {
+                "pattern": r'encryption\s*=\s*false',
+                "issue": "Encryption disabled",
+                "severity": "HIGH"
+            },
+            {
+                "pattern": r'public_access_block\s*=\s*false',
+                "issue": "Public access block disabled",
+                "severity": "HIGH"
+            },
+            {
+                "pattern": r'acl\s*=\s*["\']public-read',
+                "issue": "Public read ACL configured",
+                "severity": "HIGH"
+            },
+            {
+                "pattern": r'versioning\s*{[^}]*enabled\s*=\s*false',
+                "issue": "Versioning disabled",
+                "severity": "MEDIUM"
+            },
+            {
+                "pattern": r'(aws_access_key|aws_secret|password)\s*=\s*["\'][^"\']+["\']',
+                "issue": "Hardcoded credentials detected",
+                "severity": "CRITICAL"
+            },
+        ]
+        
+        for check in security_patterns:
+            matches = re.finditer(check["pattern"], terraform_code, re.IGNORECASE | re.DOTALL)
+            for match in matches:
+                issue = {
+                    "severity": check["severity"],
+                    "issue": check["issue"],
+                    "location": f"Line {terraform_code[:match.start()].count(chr(10)) + 1}"
+                }
+                result["issues_found"].append(issue)
+                if check["severity"] in ["HIGH", "CRITICAL"]:
+                    result["status"] = "FAIL"
+        
+        if result["status"] == "PASS" and not result["issues_found"]:
+            result["message"] = "✅ No security issues detected"
+        else:
+            result["message"] = f"❌ Found {len(result['issues_found'])} security issues"
+        
+        return result
+    
+    def _llm_code_review(self) -> Dict:
+        """Use Gemini for code review"""
+        result = {
+            "status": "PENDING",
+            "review": "",
+            "suggestions": [],
+            "issues": [],
+            "security_concerns": [],
+            "score": 0
+        }
+        
+        try:
+            terraform_code = self.terraform_file.read_text(encoding="utf-8")
+            
+            prompt = f"""
+You are an expert Terraform and AWS infrastructure reviewer. Analyze the following Terraform code.
+
+TERRAFORM CODE:
+```hcl
+{terraform_code}
+```
+
+Provide your review in JSON format:
+{{
+    "overall_score": <1-10>,
+    "issues": ["list of problems"],
+    "suggestions": ["list of improvements"],
+    "security_concerns": ["list of security issues"],
+    "summary": "brief assessment"
+}}
+"""
+            
+            llm = genai.GenerativeModel("gemini-2.5-flash")
+            response = llm.generate_content(prompt)
+            
+            review_text = response.text if hasattr(response, "text") else str(response)
+            
+            # Extract JSON
+            json_match = re.search(r'\{.*\}', review_text, re.DOTALL)
+            if json_match:
+                review_json = json.loads(json_match.group())
+                result["score"] = review_json.get("overall_score", 5)
+                result["suggestions"] = review_json.get("suggestions", [])
+                result["issues"] = review_json.get("issues", [])
+                result["security_concerns"] = review_json.get("security_concerns", [])
+                result["review"] = review_json.get("summary", review_text)
+            else:
+                result["review"] = review_text
+                result["score"] = 5
+            
+            # Determine status
+            if result["score"] >= 8:
+                result["status"] = "EXCELLENT"
+            elif result["score"] >= 6:
+                result["status"] = "GOOD"
+            elif result["score"] >= 4:
+                result["status"] = "NEEDS_IMPROVEMENT"
+            else:
+                result["status"] = "POOR"
+                
+        except Exception as e:
+            result["status"] = "ERROR"
+            result["review"] = f"Error during LLM review: {str(e)}"
+        
+        return result
+    
+    def _generate_overall_status(self):
+        """Generate overall validation status"""
+        syntax = self.validation_results["syntax_check"].get("status")
+        security = self.validation_results["security_check"].get("status")
+        llm = self.validation_results["llm_review"].get("status")
+        
+        if syntax == "FAIL" or security == "FAIL":
+            self.validation_results["overall_status"] = "FAILED"
+        elif llm in ["POOR", "NEEDS_IMPROVEMENT"]:
+            self.validation_results["overall_status"] = "NEEDS_IMPROVEMENT"
+        elif syntax == "PASS" and security == "PASS":
+            self.validation_results["overall_status"] = "PASSED"
+        else:
+            self.validation_results["overall_status"] = "PARTIAL"
+    
+    def _print_summary(self):
+        """Print validation summary"""
+        print("\n" + "="*60)
+        print("📊 VALIDATION SUMMARY")
+        print("="*60)
+        
+        status = self.validation_results["overall_status"]
+        status_emoji = "✅" if status == "PASSED" else "⚠️" if status == "PARTIAL" else "❌"
+        print(f"\n{status_emoji} Overall Status: {status}")
+        
+        print(f"\n🔧 Syntax: {self.validation_results['syntax_check'].get('status')}")
+        print(f"🔒 Security: {self.validation_results['security_check'].get('status')}")
+        print(f"🤖 LLM Review: {self.validation_results['llm_review'].get('status')} (Score: {self.validation_results['llm_review'].get('score', 0)}/10)")
+        
+        issues = self.validation_results['security_check'].get('issues_found', [])
+        if issues:
+            print(f"\n⚠️  Security Issues Found: {len(issues)}")
+            for issue in issues[:3]:
+                print(f"   • [{issue['severity']}] {issue['issue']}")
+        
+        print("="*60)
+    
+    def _is_terraform_installed(self) -> bool:
+        """Check if terraform CLI is available"""
+        try:
+            subprocess.run(["terraform", "version"], capture_output=True, timeout=5)
+            return True
+        except:
+            return False
 
 
-# Main execution
+# ============================================================================
+# GENERATOR AGENT
+# ============================================================================
+
+def get_embedding(text: str) -> List[float]:
+    """Generate embedding vector"""
+    return embedder.encode(text).tolist()
+
+
+def retrieve_docs(query: str, top_k: int = 5):
+    """Retrieve relevant Terraform docs from Pinecone"""
+    query_embedding = get_embedding(query)
+    results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
+    return results
+
+
+def generate_terraform_code(query: str, retrieved_docs, validation_feedback: Optional[Dict] = None, previous_code: Optional[str] = None) -> str:
+    """Generate Terraform code with optional validation feedback"""
+    matches = retrieved_docs.matches if hasattr(retrieved_docs, 'matches') else []
+    
+    context = "\n".join(
+        [match.metadata.get("text", "") if hasattr(match, 'metadata') else "" for match in matches]
+    )
+
+    if validation_feedback and previous_code:
+        feedback_summary = _format_validation_feedback(validation_feedback)
+        
+        prompt = f"""
+You are an expert in Terraform and AWS Infrastructure as Code.
+
+PREVIOUS ATTEMPT HAD ISSUES. You must fix the following problems:
+
+{feedback_summary}
+
+PREVIOUS CODE (WITH ERRORS):
+```hcl
+{previous_code}
+```
+
+Using the following Terraform documentation:
+{context}
+
+Original user request: '{query}'
+
+Generate a CORRECTED, production-ready Terraform configuration that:
+1. FIXES all validation errors mentioned above
+2. ADDRESSES all security issues
+3. IMPLEMENTS all suggestions from the code review
+4. Follows AWS and Terraform best practices
+5. Includes proper comments
+
+IMPORTANT: Only provide the corrected Terraform code without any additional explanations.
+"""
+    else:
+        prompt = f"""
+You are an expert in Terraform and AWS Infrastructure as Code.
+
+Using the following retrieved Terraform documentation snippets:
+{context}
+
+Generate a complete, production-ready Terraform configuration that satisfies this user request:
+'{query}'
+
+Make sure:
+- The Terraform code follows best practices
+- Uses appropriate AWS resources and variables
+- Includes comments for clarity
+- Implements security best practices (encryption, private access, versioning)
+- Uses proper resource naming and tagging
+- Just provide the Terraform code without any additional explanations
+"""
+
+    llm = genai.GenerativeModel("gemini-2.5-flash")
+    response = llm.generate_content(prompt)
+    
+    terraform_text = ""
+    if hasattr(response, "text") and response.text:
+        terraform_text = response.text
+    elif getattr(response, "output", None):
+        terraform_text = getattr(response, "output_text", "") or str(response.output)
+    else:
+        terraform_text = str(response)
+
+    terraform_text = _clean_code_output(terraform_text)
+    return terraform_text
+
+
+def _format_validation_feedback(validation_results: Dict) -> str:
+    """Format validation results into readable feedback"""
+    feedback_parts = []
+    
+    # Syntax errors
+    syntax = validation_results.get("syntax_check", {})
+    if syntax.get("status") == "FAIL":
+        feedback_parts.append("SYNTAX ERRORS:")
+        for detail in syntax.get("details", [])[:5]:
+            feedback_parts.append(f"  - {detail.get('summary', 'Unknown error')}")
+    
+    # Security issues
+    security = validation_results.get("security_check", {})
+    issues = security.get("issues_found", [])
+    if issues:
+        feedback_parts.append("\nSECURITY ISSUES:")
+        for issue in issues[:10]:
+            feedback_parts.append(f"  - [{issue['severity']}] {issue['issue']} at {issue['location']}")
+    
+    # LLM review
+    llm_review = validation_results.get("llm_review", {})
+    if llm_review.get("issues"):
+        feedback_parts.append("\nCODE REVIEW ISSUES:")
+        for issue in llm_review["issues"][:5]:
+            feedback_parts.append(f"  - {issue}")
+    
+    if llm_review.get("suggestions"):
+        feedback_parts.append("\nIMPROVEMENT SUGGESTIONS:")
+        for suggestion in llm_review["suggestions"][:5]:
+            feedback_parts.append(f"  - {suggestion}")
+    
+    if llm_review.get("security_concerns"):
+        feedback_parts.append("\nSECURITY CONCERNS:")
+        for concern in llm_review["security_concerns"][:5]:
+            feedback_parts.append(f"  - {concern}")
+    
+    return "\n".join(feedback_parts) if feedback_parts else "Minor improvements needed."
+
+
+def _clean_code_output(code: str) -> str:
+    """Remove markdown code blocks"""
+    code = code.replace("```hcl", "").replace("```terraform", "").replace("```", "")
+    return code.strip()
+
+
+def save_terraform_to_file(terraform_code: str, base_dir: str = "generated", filename: str = "main.tf") -> str:
+    """Save terraform code to file"""
+    out_dir = pathlib.Path(base_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / filename
+    out_path.write_text(terraform_code, encoding="utf-8")
+    print(f"✅ Written Terraform to: {out_path.resolve()}")
+
+    if shutil.which("terraform"):
+        try:
+            subprocess.run(["terraform", "fmt", str(out_path)], check=True, capture_output=True)
+            print("✅ Ran `terraform fmt` on the generated file.")
+        except subprocess.CalledProcessError as e:
+            print("⚠️ terraform fmt failed:", e.stderr.decode() if e.stderr else e)
+
+    return str(out_path.resolve())
+
+
+# ============================================================================
+# MAIN FEEDBACK LOOP
+# ============================================================================
+
+def rag_generate_terraform_with_validation(query: str, out_dir: str = "generated", max_iterations: int = 3):
+    """Generate Terraform code with validation feedback loop"""
+    print("\n" + "="*70)
+    print("🚀 TERRAFORM GENERATION WITH VALIDATION FEEDBACK LOOP")
+    print("="*70)
+    
+    iteration = 0
+    validation_results = None
+    terraform_code = None
+    saved_path = None
+    retrieved_docs = None
+    
+    while iteration < max_iterations:
+        iteration += 1
+        print(f"\n{'='*70}")
+        print(f"🔄 ITERATION {iteration}/{max_iterations}")
+        print(f"{'='*70}")
+        
+        # Step 1: Generate or Regenerate Code
+        if iteration == 1:
+            print(f"\n🔍 Query: {query}")
+            retrieved_docs = retrieve_docs(query)
+            matches_count = len(retrieved_docs.matches) if hasattr(retrieved_docs, 'matches') else 0
+            print(f"✅ Retrieved {matches_count} relevant documents.")
+            
+            terraform_code = generate_terraform_code(query, retrieved_docs)
+            print("\n💡 Generated initial Terraform code")
+        else:
+            print(f"\n🔧 Regenerating code based on validation feedback...")
+            terraform_code = generate_terraform_code(
+                query, 
+                retrieved_docs, 
+                validation_feedback=validation_results,
+                previous_code=terraform_code
+            )
+            print("✅ Regenerated Terraform code with fixes")
+        
+        # Step 2: Save the code
+        saved_path = save_terraform_to_file(terraform_code, base_dir=out_dir, filename="main.tf")
+        
+        # Step 3: Validate the code
+        print("\n🔍 Running validation checks...")
+        validator = TerraformValidator(saved_path)
+        validation_results = validator.validate_all()
+        
+        # Step 4: Check if validation passed
+        overall_status = validation_results.get("overall_status", "UNKNOWN")
+        
+        if overall_status == "PASSED":
+            print("\n" + "="*70)
+            print("✅ SUCCESS! Terraform code passed all validations!")
+            print("="*70)
+            break
+        elif iteration < max_iterations:
+            print(f"\n⚠️ Validation found issues. Attempting to fix... ({iteration}/{max_iterations})")
+        else:
+            print("\n" + "="*70)
+            print(f"❌ Maximum iterations ({max_iterations}) reached.")
+            print("Code generated but may still have issues. Manual review required.")
+            print("="*70)
+    
+    # Final Summary
+    print("\n" + "="*70)
+    print("📊 FINAL SUMMARY")
+    print("="*70)
+    print(f"Total iterations: {iteration}")
+    print(f"Final status: {validation_results.get('overall_status', 'UNKNOWN')}")
+    print(f"Output file: {saved_path}")
+    
+    # Save iteration history
+    history_file = pathlib.Path(out_dir) / "generation_history.json"
+    history = {
+        "query": query,
+        "iterations": iteration,
+        "final_status": validation_results.get("overall_status"),
+        "validation_results": validation_results
+    }
+    with open(history_file, 'w', encoding='utf-8') as f:
+        json.dump(history, f, indent=2)
+    print(f"Generation history saved to: {history_file}")
+    
+    return {
+        "terraform_file": saved_path,
+        "validation_results": validation_results,
+        "iterations": iteration,
+        "success": overall_status == "PASSED"
+    }
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
 if __name__ == "__main__":
-    API_KEY = os.getenv("GEMINI_API_KEY")
-    if not API_KEY:
-        print("❌ Please set GEMINI_API_KEY environment variable")
-        exit(1)
+    user_query = "Create an S3 bucket with versioning and server-side encryption"
     
-    # Optional: Set GITHUB_TOKEN for better rate limits
-    if not os.getenv("GITHUB_TOKEN"):
-        print("ℹ️  Tip: Set GITHUB_TOKEN for better GitHub API access")
-    
-    rag = TerraformRAG(gemini_api_key=API_KEY)
-    
-    # Fetch examples with improved strategy
-    services = ["vpc", "s3", "ec2", "rds", "lambda"]
-    rag.fetch_examples_improved(services, use_templates=True)
-    
-    # Generate code
-    print(f"\n{'='*70}")
-    print("GENERATING TERRAFORM CODE")
-    print(f"{'='*70}\n")
-    
-    result = rag.generate_terraform(
-        requirement="Secure web application with load balancer and RDS database",
-        aws_service="EC2, ALB, RDS"
+    result = rag_generate_terraform_with_validation(
+        user_query, 
+        out_dir="generated",
+        max_iterations=3
     )
     
-    print("📄 MAIN.TF:")
-    print("-" * 70)
-    print(result.get("main_tf", ""))
-    
-    if "variables_tf" in result:
-        print("\n📄 VARIABLES.TF:")
-        print("-" * 70)
-        print(result.get("variables_tf", ""))
-    
-    if "outputs_tf" in result:
-        print("\n📄 OUTPUTS.TF:")
-        print("-" * 70)
-        print(result.get("outputs_tf", ""))
-    
-    print("\n💡 EXPLANATION:")
-    print("-" * 70)
-    print(result.get("explanation", ""))
+    if result["success"]:
+        print("\n🎉 Terraform code is ready for deployment!")
+    else:
+        print("\n⚠️ Please review the generated code manually before deployment.")
