@@ -22,7 +22,7 @@ load_dotenv()
 # ---------------------------
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-INDEX_NAME = "terraform-iac-v1"
+INDEX_NAME = "terraform-iac-v1"  
 
 # Initialize APIs
 genai.configure(api_key=GEMINI_API_KEY)

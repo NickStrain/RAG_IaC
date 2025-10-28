@@ -1,389 +1,483 @@
-# providers.tf
-# Define the AWS provider and region
+# Configure the AWS provider
 provider "aws" {
-  region = var.aws_region
+  region = var.aws_region # Use the externalized AWS region variable
 }
 
-# main.tf
-# Data source to retrieve the current AWS account ID, used in IAM policies.
-data "aws_caller_identity" "current" {}
-
-# Resource to generate a random suffix for bucket names, ensuring global uniqueness
-# when a bucket_name is not explicitly provided by the user.
-resource "random_id" "bucket_suffix" {
-  byte_length = 8
-}
-
-# Local values for bucket names, allowing for dynamic default uniqueness.
-locals {
-  # If 'var.bucket_name' is explicitly set, use it.
-  # Otherwise, generate a unique name using a prefix and a random suffix.
-  final_main_bucket_name = coalesce(var.bucket_name, "my-app-data-${random_id.bucket_suffix.hex}")
-  # The log bucket name is derived from the main bucket name.
-  final_log_bucket_name  = "${local.final_main_bucket_name}${var.log_bucket_suffix}"
-}
-
-# AWS Key Management Service (KMS) Key for S3 Server-Side Encryption (SSE-KMS)
-# This key provides more control over encryption keys compared to S3-managed keys (SSE-S3).
-resource "aws_kms_key" "s3_bucket_kms_key" {
-  description             = "KMS key for S3 bucket ${local.final_main_bucket_name} encryption"
-  deletion_window_in_days = 10 # Required for KMS key deletion to prevent immediate accidental deletion
-  enable_key_rotation     = true # Automatically rotate the key annually
-
-  # KMS Key Policy allows the AWS account to delegate permissions via IAM policies,
-  # and allows the S3 service to use the key for encryption and decryption.
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Id      = "key-policy-1"
-    Statement = [
-      {
-        Sid       = "Enable IAM User Permissions"
-        Effect    = "Allow"
-        # Grants the AWS account full access to the KMS key, allowing IAM policies
-        # to grant specific permissions to users/roles within the account.
-        Principal = { AWS = data.aws_caller_identity.current.account_id }
-        Action    = "kms:*"
-        Resource  = "*"
-      },
-      {
-        Sid       = "Allow S3 to use the key for encryption and decryption"
-        Effect    = "Allow"
-        Principal = { Service = "s3.amazonaws.com" }
-        Action = [
-          "kms:GenerateDataKey",
-          "kms:Decrypt"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-
-  tags = {
-    Name        = "${local.final_main_bucket_name}-kms-key"
-    Environment = var.environment
-    Project     = var.project
-    ManagedBy   = "Terraform"
-  }
-}
-
-# KMS Key Alias for easier referencing of the KMS key
-resource "aws_kms_alias" "s3_bucket_kms_alias" {
-  name          = "alias/${var.kms_key_alias_name}"
-  target_key_id = aws_kms_key.s3_bucket_kms_key.key_id
-}
-
-# S3 Log Bucket Resource
-# This dedicated bucket stores server access logs for the main S3 bucket.
-# It uses "BucketOwnerEnforced" for object ownership, which is a best practice for logging buckets.
-# This ensures logs are owned by the bucket owner and access is managed purely through bucket policies,
-# making ACLs irrelevant for this bucket.
-resource "aws_s3_bucket" "log_bucket" {
-  bucket = local.final_log_bucket_name
-
-  # "BucketOwnerEnforced" disables ACLs; all access control is via bucket policies.
-  # This is the recommended best practice for new buckets.
-  object_ownership = "BucketOwnerEnforced"
-
-  # Prevent accidental deletion of this critical log bucket.
-  lifecycle {
-    prevent_destroy = true
-  }
-
-  tags = {
-    Name        = "${local.final_main_bucket_name}-logs"
-    Environment = var.environment
-    Project     = var.project
-    ManagedBy   = "Terraform"
-  }
-}
-
-# S3 Log Bucket Public Access Block (Essential for security)
-# This resource prevents any form of public access to the log bucket, ensuring logs remain private.
-resource "aws_s3_bucket_public_access_block" "log_bucket_public_access_block" {
-  bucket = aws_s3_bucket.log_bucket.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# S3 Log Bucket Versioning
-# Enables versioning for the log bucket to protect against accidental deletion or overwrites of log files.
-resource "aws_s3_bucket_versioning" "log_bucket_versioning" {
-  bucket = aws_s3_bucket.log_bucket.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# S3 Log Bucket Server-Side Encryption Configuration (SSE-S3)
-# Enforces server-side encryption for all log objects stored in this bucket using S3-managed keys (AES256).
-# This is generally sufficient for log data.
-resource "aws_s3_bucket_server_side_encryption_configuration" "log_bucket_encryption" {
-  bucket = aws_s3_bucket.log_bucket.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-# S3 Log Bucket Lifecycle Configuration
-# Defines rules to manage the lifecycle of log objects, such as expiration, to optimize storage costs.
-resource "aws_s3_bucket_lifecycle_configuration" "log_bucket_lifecycle" {
-  bucket = aws_s3_bucket.log_bucket.id
-
-  rule {
-    id     = "expire-logs"
-    status = "Enabled"
-
-    expiration {
-      days = var.log_bucket_lifecycle_expiration_days # Logs expire after a specified number of days
-    }
-
-    # For versioned buckets, it's good practice to also expire non-current versions
-    noncurrent_version_expiration {
-      noncurrent_days = var.log_bucket_lifecycle_expiration_days # Expire non-current log versions
-    }
-  }
-}
-
-# S3 Log Bucket Policy
-# This policy allows the S3 service principal to deliver access logs to this bucket.
-# It is necessary because `object_ownership` is set to "BucketOwnerEnforced" for this logging bucket,
-# which relies solely on bucket policies for access control.
-resource "aws_s3_bucket_policy" "log_bucket_policy" {
-  bucket = aws_s3_bucket.log_bucket.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid       = "S3BucketPolicyForS3Logging"
-        Effect    = "Allow"
-        Principal = { Service = "logging.s3.amazonaws.com" }
-        Action    = "s3:PutObject"
-        Resource  = "${aws_s3_bucket.log_bucket.arn}/*"
-      }
-    ]
-  })
-}
-
-# Main S3 Bucket Resource
-# This is the primary S3 bucket for application data.
-resource "aws_s3_bucket" "main_bucket" {
-  bucket = local.final_main_bucket_name
-
-  # "BucketOwnerEnforced" is the recommended best practice. It simplifies
-  # permission management by disabling ACLs entirely, relying solely on
-  # IAM and bucket policies. This aligns with modern S3 best practices.
-  object_ownership = "BucketOwnerEnforced"
-
-  # Prevent accidental deletion of this critical production bucket.
-  lifecycle {
-    prevent_destroy = true
-  }
-
-  tags = {
-    Name        = local.final_main_bucket_name
-    Environment = var.environment
-    Project     = var.project
-    ManagedBy   = "Terraform"
-  }
-}
-
-# The 'aws_s3_bucket_acl' resource is removed because 'object_ownership = "BucketOwnerEnforced"'
-# disables ACLs and relies purely on IAM and bucket policies for access control,
-# which is the recommended best practice.
-
-# S3 Bucket Public Access Block (Crucial for security)
-# This resource prevents public access to the bucket by blocking public ACLs,
-# public policies, and overriding public access granted inadvertently.
-resource "aws_s3_bucket_public_access_block" "main_bucket_public_access_block" {
-  bucket = aws_s3_bucket.main_bucket.id
-
-  block_public_acls       = true # Blocks new public ACLs and updating existing public ACLs
-  block_public_policy     = true # Blocks new public bucket policies and updating existing public bucket policies
-  ignore_public_acls      = true # Ignores public ACLs on objects when evaluating object access
-  restrict_public_buckets = true # Restricts access to only AWS services and authorized users if a bucket has a public policy
-}
-
-# S3 Bucket Versioning Configuration
-# Enables versioning to keep multiple variants of an object, allowing recovery from
-# accidental deletions or overwrites.
-resource "aws_s3_bucket_versioning" "main_bucket_versioning" {
-  bucket = aws_s3_bucket.main_bucket.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# S3 Bucket Server-Side Encryption Configuration (SSE-KMS)
-# Enforces server-side encryption for all objects stored in the main bucket using the
-# AWS KMS key defined above, providing more granular control over encryption keys.
-resource "aws_s3_bucket_server_side_encryption_configuration" "main_bucket_encryption" {
-  bucket = aws_s3_bucket.main_bucket.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm     = "aws:kms"
-      kms_master_key_id = aws_kms_key.s3_bucket_kms_key.arn # Use the ARN of the created KMS key
-    }
-  }
-}
-
-# S3 Bucket Logging Configuration
-# Enables server access logging for the main bucket, sending logs to the dedicated log bucket.
-# This is crucial for auditing and security monitoring.
-resource "aws_s3_bucket_logging" "main_bucket_logging" {
-  bucket        = aws_s3_bucket.main_bucket.id
-  target_bucket = aws_s3_bucket.log_bucket.id
-  target_prefix = "s3-access-logs/" # Prefix to organize logs within the target log bucket
-}
-
-# S3 Bucket Lifecycle Configuration
-# Defines rules for object transitions and expiration in the main bucket, optimizing storage costs.
-resource "aws_s3_bucket_lifecycle_configuration" "main_bucket_lifecycle" {
-  bucket = aws_s3_bucket.main_bucket.id
-
-  rule {
-    id     = "standard-to-ia-to-glacier-and-expire"
-    status = "Enabled"
-
-    # Transition objects to Standard-IA (Infrequent Access) after a specified period
-    transition {
-      days          = var.main_bucket_lifecycle_transition_ia_days
-      storage_class = "STANDARD_IA"
-    }
-
-    # Transition objects to Glacier after another specified period for archival
-    transition {
-      days          = var.main_bucket_lifecycle_transition_glacier_days
-      storage_class = "GLACIER"
-    }
-
-    # Expire current versions of objects after a very long period (e.g., 10 years)
-    expiration {
-      days = var.main_bucket_lifecycle_expiration_days_current
-    }
-
-    # Expire non-current versions of objects after a shorter period (e.g., 7 days)
-    # This helps manage costs while retaining versioning for recent changes.
-    noncurrent_version_expiration {
-      noncurrent_days = var.main_bucket_lifecycle_expiration_days_noncurrent
-    }
-  }
-}
-
-
-# outputs.tf
-# Outputs provide critical attributes of the created resources for external reference.
-
-output "main_bucket_id" {
-  description = "The ID (name) of the main S3 bucket."
-  value       = aws_s3_bucket.main_bucket.id
-}
-
-output "main_bucket_arn" {
-  description = "The ARN of the main S3 bucket."
-  value       = aws_s3_bucket.main_bucket.arn
-}
-
-output "main_bucket_regional_domain_name" {
-  description = "The regional domain name of the main S3 bucket."
-  value       = aws_s3_bucket.main_bucket.bucket_regional_domain_name
-}
-
-output "log_bucket_id" {
-  description = "The ID (name) of the S3 log bucket."
-  value       = aws_s3_bucket.log_bucket.id
-}
-
-output "log_bucket_arn" {
-  description = "The ARN of the S3 log bucket."
-  value       = aws_s3_bucket.log_bucket.arn
-}
-
-output "log_bucket_regional_domain_name" {
-  description = "The regional domain name of the S3 log bucket."
-  value       = aws_s3_bucket.log_bucket.bucket_regional_domain_name
-}
-
-output "s3_kms_key_arn" {
-  description = "The ARN of the KMS key used for S3 encryption."
-  value       = aws_kms_key.s3_bucket_kms_key.arn
-}
-
-output "s3_kms_key_alias_arn" {
-  description = "The ARN of the KMS key alias used for S3 encryption."
-  value       = aws_kms_alias.s3_bucket_kms_alias.arn
-}
-
-
-# variables.tf
-# Input variables for the S3 bucket and associated resource configurations.
-
-variable "bucket_name" {
-  description = "The name for the main S3 bucket. If not provided, a unique name will be generated using a default prefix and a random suffix."
-  type        = string
-  default     = null # Setting default to null allows 'coalesce' in locals to provide a dynamic unique name.
-}
-
+# Input variables for customization
 variable "aws_region" {
-  description = "The AWS region where resources will be created."
+  description = "The AWS region where resources will be deployed."
   type        = string
   default     = "us-east-1"
 }
 
+variable "bucket_name_prefix" {
+  description = "A unique prefix for the S3 bucket name. A random suffix will be appended."
+  type        = string
+  default     = "my-secure-app-bucket"
+}
+
+variable "logging_bucket_name_prefix" {
+  description = "A unique prefix for the S3 logging bucket name. A random suffix will be appended."
+  type        = string
+  default     = "my-app-logs-bucket"
+}
+
 variable "environment" {
-  description = "The deployment environment (e.g., 'prod', 'staging', 'dev'). Used for tagging."
+  description = "The deployment environment (e.g., dev, stage, prod)."
   type        = string
-  default     = "prod"
+  default     = "production"
 }
 
-variable "project" {
-  description = "The project name this bucket belongs to. Used for tagging."
+variable "application_iam_role_arn" {
+  description = "ARN of the IAM role that needs access to the main S3 bucket for application operations. Example: arn:aws:iam::123456789012:role/MyApplicationRole"
   type        = string
-  default     = "MyWebApp"
+  default     = "" # Provide a specific IAM role ARN for application access or leave empty if not immediately known
 }
 
-variable "kms_key_alias_name" {
-  description = "The alias name for the KMS key, which will be prefixed with 'alias/'."
-  type        = string
-  default     = "s3/main-app-bucket-key"
+# Data source to get the current AWS account ID dynamically
+data "aws_caller_identity" "current" {}
+
+# Generate random strings to ensure S3 bucket names are globally unique
+resource "random_id" "bucket_suffix" {
+  byte_length = 8
 }
 
-variable "log_bucket_suffix" {
-  description = "A suffix to append to the main bucket name to create the unique log bucket name."
-  type        = string
-  default     = "-logs"
+resource "random_id" "logging_bucket_suffix" {
+  byte_length = 8
 }
 
-variable "main_bucket_lifecycle_expiration_days_current" {
-  description = "Number of days after object creation to expire current versions in the main bucket. Set to a very long period for important data."
-  type        = number
-  default     = 3650 # 10 years
+# -----------------------------------------------------------------------------
+# AWS KMS Key for Server-Side Encryption
+# -----------------------------------------------------------------------------
+# Create an AWS KMS Key dedicated for S3 server-side encryption.
+# Using KMS provides greater control over encryption keys, allows for auditing
+# key usage, and supports automatic key rotation, enhancing security beyond SSE-S3 (AES256).
+resource "aws_kms_key" "s3_encryption_key" {
+  description             = "KMS key for S3 bucket ${var.bucket_name_prefix}"
+  deletion_window_in_days = 7 # Minimum value is 7 days, allows time to recover from accidental deletion
+  enable_key_rotation     = true # Automatically rotate the key annually for enhanced security
+
+  # Define the key policy to allow the account root user and the S3 service
+  # to use the key for encryption/decryption. This is crucial for S3 default encryption.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "Enable IAM User Permissions"
+        Effect = "Allow"
+        # Allow the account root user to administer the key
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "Allow S3 to use the key for bucket default encryption"
+        Effect    = "Allow"
+        Principal = { Service = "s3.amazonaws.com" }
+        Action    = [
+          "kms:GenerateDataKey",
+          "kms:Decrypt",
+          "kms:Encrypt"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            # Restrict key usage to operations originating from the specific AWS account.
+            # The bucket's default encryption configuration implicitly links the key to the bucket.
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      },
+      # Dynamically add a statement to allow a specific application IAM role to use the KMS key
+      # if 'application_iam_role_arn' is provided. This grants necessary permissions
+      # for the application to interact with encrypted objects.
+      dynamic "statement" {
+        for_each = var.application_iam_role_arn != "" ? [1] : []
+        content {
+          Sid       = "AllowApplicationRoleToUseKMSKey"
+          Effect    = "Allow"
+          Principal = { AWS = var.application_iam_role_arn }
+          Action    = [
+            "kms:Decrypt",
+            "kms:Encrypt",
+            "kms:ReEncrypt*",
+            "kms:GenerateDataKey*",
+            "kms:DescribeKey"
+          ]
+          Resource = "*"
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name        = "${var.bucket_name_prefix}-kms-key"
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+    Purpose     = "S3Encryption"
+  }
 }
 
-variable "main_bucket_lifecycle_transition_ia_days" {
-  description = "Number of days after object creation to transition to STANDARD_IA storage class in the main bucket."
-  type        = number
-  default     = 30
+# Add a KMS Key Alias for improved manageability and easier referencing in the AWS Console.
+resource "aws_kms_alias" "s3_encryption_alias" {
+  name          = "alias/${var.bucket_name_prefix}-s3-key"
+  target_key_id = aws_kms_key.s3_encryption_key.id
+
+  tags = {
+    Name        = "${var.bucket_name_prefix}-kms-key-alias"
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+    Purpose     = "S3EncryptionAlias"
+  }
 }
 
-variable "main_bucket_lifecycle_transition_glacier_days" {
-  description = "Number of days after object creation to transition to GLACIER storage class in the main bucket."
-  type        = number
-  default     = 90
+# -----------------------------------------------------------------------------
+# Main Application S3 Bucket
+# (Defined before logging bucket policy to resolve forward reference)
+# -----------------------------------------------------------------------------
+# Create an S3 bucket for application data with versioning and server-side encryption (KMS).
+resource "aws_s3_bucket" "production_bucket" {
+  # Construct a globally unique bucket name using a prefix and a random suffix
+  bucket = "${var.bucket_name_prefix}-${random_id.bucket_suffix.hex}"
+
+  # Enable S3 Versioning to keep multiple variants of an object.
+  # This helps in preserving, retrieving, and restoring every version of objects,
+  # recovering from unintended user actions or application failures.
+  versioning {
+    enabled = true
+    # For extremely sensitive data, consider enabling MFA Delete here:
+    # mfa_delete = "Enabled"
+    # IMPORTANT: Enabling MFA Delete requires an MFA device serial number,
+    # which is not typically managed declaratively in Terraform for initial setup
+    # as it requires interactive input of an MFA token. It often requires
+    # manual activation post-creation or via custom scripts.
+    # Leaving it commented out for general IaC deployments.
+  }
+
+  # Configure default server-side encryption for all objects in the bucket
+  # Using AWS KMS for enhanced key management, auditing, and key rotation.
+  server_side_encryption_configuration {
+    rule {
+      apply_server_side_encryption_by_default {
+        sse_algorithm     = "aws:kms"
+        kms_master_key_id = aws_kms_key.s3_encryption_key.arn # Reference the created KMS key
+      }
+    }
+  }
+
+  # Enforce 'BucketOwnerEnforced' object ownership.
+  # This disables ACLs for the bucket and objects within it, simplifying access management
+  # by ensuring that all objects are owned by the bucket owner. This is an AWS best practice.
+  object_ownership = "BucketOwnerEnforced"
+
+  # Standard tags for resource identification, management, and cost allocation
+  tags = {
+    Name        = "${var.bucket_name_prefix}-data"
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+    Purpose     = "ApplicationDataStorage"
+  }
 }
 
-variable "main_bucket_lifecycle_expiration_days_noncurrent" {
-  description = "Number of days after an object becomes a non-current version to expire it in the main bucket."
-  type        = number
-  default     = 7 # Keep non-current versions for 7 days
+# Block all public access to the S3 bucket.
+# This is a critical security measure to prevent accidental or malicious public exposure of data.
+# It should be applied to almost all private S3 buckets.
+resource "aws_s3_bucket_public_access_block" "production_bucket_public_access_block" {
+  bucket = aws_s3_bucket.production_bucket.id
+
+  # Prevents new public ACLs from being granted
+  block_public_acls = true
+  # Ignores existing public ACLs
+  ignore_public_acls = true
+  # Prevents new public bucket policies from being granted
+  block_public_policy = true
+  # Restricts access to only authorized AWS services or users
+  restrict_public_buckets = true
 }
 
-variable "log_bucket_lifecycle_expiration_days" {
-  description = "Number of days after object creation to expire all objects (logs) in the log bucket."
-  type        = number
-  default     = 365 # 1 year
+# S3 Bucket Policy for the main application bucket.
+# Explicitly defines *who* (e.g., specific IAM roles/users) can access the bucket
+# and *what actions* (e.g., s3:GetObject, s3:PutObject) they can perform.
+# This adds a critical layer of access control beyond IAM policies on principals.
+resource "aws_s3_bucket_policy" "production_bucket_policy" {
+  bucket = aws_s3_bucket.production_bucket.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      # Allow the AWS account root user or administrators with full S3 access
+      # to perform any action on the bucket. This is a common baseline for account owners.
+      {
+        Sid       = "AllowBucketOwnerFullAccess"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.production_bucket.arn,
+          "${aws_s3_bucket.production_bucket.arn}/*"
+        ]
+      },
+      # Dynamically add a statement to allow a specific application IAM role to perform
+      # specific S3 actions. This grants necessary permissions for the application
+      # to interact with objects in the bucket, following the principle of least privilege.
+      dynamic "statement" {
+        for_each = var.application_iam_role_arn != "" ? [1] : []
+        content {
+          Sid       = "AllowApplicationRoleAccess"
+          Effect    = "Allow"
+          Principal = { AWS = var.application_iam_role_arn }
+          Action    = [
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:DeleteObject",
+            "s3:ListBucket",
+            "s3:GetBucketLocation", # Added s3:GetBucketLocation for full S3 client compatibility
+            "s3:ListBucketMultipartUploads",
+            "s3:ListMultipartUploadParts"
+          ]
+          Resource = [
+            aws_s3_bucket.production_bucket.arn,
+            "${aws_s3_bucket.production_bucket.arn}/*"
+          ]
+        }
+      }
+      # You may need to add more statements for other AWS services (e.g., Lambda, EC2)
+      # or cross-account access if your application architecture requires it.
+    ]
+  })
+}
+
+# S3 Lifecycle Configuration for the main application bucket.
+# Defines rules for object transitions to lower-cost storage classes (e.g., S3 Intelligent-Tiering, Glacier)
+# after a certain period, or to expire old object versions to optimize costs and meet data retention policies.
+resource "aws_s3_bucket_lifecycle_configuration" "production_bucket_lifecycle" {
+  bucket = aws_s3_bucket.production_bucket.id
+
+  rule {
+    id     = "current-version-data-lifecycle"
+    status = "Enabled"
+
+    # Transition current version objects to S3 Intelligent-Tiering after 30 days.
+    # Intelligent-Tiering automatically moves objects between storage tiers (Standard, IA, Archive Access)
+    # based on access patterns, optimizing costs without performance impact.
+    transition {
+      days          = 30
+      storage_class = "INTELLIGENT_TIERING"
+    }
+
+    # Expire objects after 365 days if they are no longer needed, to optimize costs.
+    # This rule was previously commented out and is now enabled.
+    expiration {
+      days = 365
+    }
+
+    # Clean up incomplete multipart uploads after 7 days to prevent lingering parts
+    # from incurring storage costs.
+    abort_incomplete_multipart_upload_days = 7
+  }
+
+  rule {
+    id     = "previous-versions-data-lifecycle"
+    status = "Enabled"
+
+    # Expire previous (noncurrent) versions of objects after 90 days.
+    # This helps manage storage costs while retaining a history for recovery for a defined period.
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
+
+    # Optional: Transition noncurrent versions to lower-cost storage before expiring them.
+    # This can further optimize costs if previous versions are rarely accessed but need longer retention.
+    # noncurrent_version_transition {
+    #   noncurrent_days = 30
+    #   storage_class   = "STANDARD_IA"
+    # }
+    # noncurrent_version_transition {
+    #   noncurrent_days = 60
+    #   storage_class   = "GLACIER"
+    # }
+  }
+}
+
+# -----------------------------------------------------------------------------
+# S3 Logging Bucket
+# -----------------------------------------------------------------------------
+# Dedicated S3 bucket for storing access logs from other S3 buckets.
+# It is best practice to deliver access logs to a separate, highly restricted
+# S3 bucket, ideally in a dedicated logging account.
+resource "aws_s3_bucket" "logging_bucket" {
+  bucket = "${var.logging_bucket_name_prefix}-${random_id.logging_bucket_suffix.hex}"
+
+  # Enable S3 Versioning for log integrity and recovery
+  versioning {
+    enabled = true
+  }
+
+  # Enforce 'BucketOwnerEnforced' object ownership for logs
+  # This simplifies access management by disabling ACLs for log objects.
+  object_ownership = "BucketOwnerEnforced"
+
+  # Server-side encryption for logs (SSE-S3 is generally sufficient for logs themselves)
+  server_side_encryption_configuration {
+    rule {
+      apply_server_side_encryption_by_default {
+        sse_algorithm = "AES256"
+      }
+    }
+  }
+
+  tags = {
+    Name        = "${var.logging_bucket_name_prefix}-data"
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+    Purpose     = "S3AccessLogs"
+  }
+}
+
+# Block all public access for the logging S3 bucket.
+# This is a critical security measure for any S3 bucket, especially logging buckets,
+# to prevent accidental or malicious public exposure of audit data.
+resource "aws_s3_bucket_public_access_block" "logging_bucket_public_access_block" {
+  bucket = aws_s3_bucket.logging_bucket.id
+
+  block_public_acls       = true
+  ignore_public_acls      = true
+  block_public_policy     = true
+  restrict_public_buckets = true
+}
+
+# S3 Lifecycle Configuration for the logging bucket.
+# Defines rules to manage object storage costs and retention for logs.
+# Typically, logs can be transitioned to lower-cost storage classes and expired after a set period.
+resource "aws_s3_bucket_lifecycle_configuration" "logging_bucket_lifecycle" {
+  bucket = aws_s3_bucket.logging_bucket.id
+
+  rule {
+    id     = "expire-and-transition-logs"
+    status = "Enabled"
+
+    # Transition current version log objects to lower-cost storage after 30 days
+    transition {
+      days          = 30
+      storage_class = "GLACIER_IR" # For infrequently accessed logs
+    }
+
+    # Expire log objects after 365 days. Adjust based on compliance requirements.
+    expiration {
+      days = 365
+    }
+
+    # Clean up incomplete multipart uploads after 7 days to prevent lingering parts incurring costs
+    abort_incomplete_multipart_upload_days = 7
+  }
+
+  rule {
+    id     = "expire-previous-versions-of-logs"
+    status = "Enabled"
+
+    # Expire previous versions of log objects after 90 days to save costs while retaining recent history
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
+  }
+}
+
+# S3 Bucket Policy for the logging bucket.
+# This policy is crucial to allow the S3 service to deliver logs to this bucket.
+# It restricts the `s3:PutObject` action to the S3 service principal and ensures
+# logs originate from the source account and specific S3 bucket.
+# This resource is now defined AFTER aws_s3_bucket.production_bucket to resolve forward reference.
+resource "aws_s3_bucket_policy" "logging_bucket_policy" {
+  bucket = aws_s3_bucket.logging_bucket.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "S3ServerAccessLogsPolicy"
+        Effect = "Allow"
+        Principal = {
+          Service = "s3.amazonaws.com"
+        }
+        Action = "s3:PutObject"
+        Resource = [
+          "${aws_s3_bucket.logging_bucket.arn}/*"
+        ]
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id,
+            "s3:x-amz-acl"      = "bucket-owner-full-control" # Required by S3 for cross-bucket log delivery
+          }
+          ArnLike = {
+            # Ensure logs are only delivered from the specific production bucket
+            "aws:SourceArn" = aws_s3_bucket.production_bucket.arn
+          }
+        }
+      },
+      {
+        Sid    = "S3ServerAccessLogsGetBucketAcl"
+        Effect = "Allow"
+        Principal = {
+          Service = "s3.amazonaws.com"
+        }
+        Action = "s3:GetBucketAcl"
+        Resource = [
+          aws_s3_bucket.logging_bucket.arn
+        ]
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+          ArnLike = {
+            "aws:SourceArn" = aws_s3_bucket.production_bucket.arn
+          }
+        }
+      }
+    ]
+  })
+}
+
+
+# S3 Access Logging Configuration for the main application bucket.
+# Enables S3 access logs, configuring them to be delivered to the separate,
+# highly restricted logging bucket created earlier. This provides an essential
+# audit trail of all access requests to your bucket for security monitoring and compliance.
+resource "aws_s3_bucket_logging_v2" "production_bucket_logging" {
+  bucket = aws_s3_bucket.production_bucket.id
+
+  target_bucket = aws_s3_bucket.logging_bucket.id
+  # Optional: Define a prefix for log objects within the target bucket for better organization.
+  target_prefix = "logs/${var.bucket_name_prefix}-${random_id.bucket_suffix.hex}/"
+}
+
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
+# Output the globally unique name of the main application S3 bucket for easy reference.
+output "s3_bucket_name" {
+  description = "The globally unique name of the main application S3 bucket."
+  value       = aws_s3_bucket.production_bucket.bucket
+}
+
+# Output the ARN (Amazon Resource Name) of the main application S3 bucket.
+output "s3_bucket_arn" {
+  description = "The ARN of the main application S3 bucket."
+  value       = aws_s3_bucket.production_bucket.arn
+}
+
+# Output the globally unique name of the S3 logging bucket.
+output "s3_logging_bucket_name" {
+  description = "The globally unique name of the S3 logging bucket."
+  value       = aws_s3_bucket.logging_bucket.bucket
+}
+
+# Output the ARN of the KMS key used for S3 encryption.
+output "kms_key_arn" {
+  description = "The ARN of the KMS key used for S3 encryption."
+  value       = aws_kms_key.s3_encryption_key.arn
+}
+
+# Output the ARN of the KMS key alias for S3 encryption.
+output "kms_key_alias_arn" {
+  description = "The ARN of the KMS key alias used for S3 encryption."
+  value       = aws_kms_alias.s3_encryption_alias.arn
 }
