@@ -1,565 +1,765 @@
-"""
-Integrated RAG-based Terraform Generation System with Validation Feedback Loop
-Complete system with generator and validator in one file.
-"""
-
-import os
-from typing import List, Dict, Optional
-import google.generativeai as genai
+import ollama 
 from pinecone import Pinecone
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
-import pathlib
-import shutil
-import subprocess
+import os
 import json
 import re
+from datetime import datetime
+from google import genai
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from enum import Enum
 
+from dotenv import load_dotenv  
 load_dotenv()
 
-# ---------------------------
-# Environment Variables
-# ---------------------------
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-INDEX_NAME = "terraform-iac-v1"  
 
-# Initialize APIs
-genai.configure(api_key=GEMINI_API_KEY)
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(INDEX_NAME)
-embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+class SearchStrategy(Enum):
+    """Enumeration of different search strategies"""
+    SEMANTIC = "semantic"
+    STRUCTURAL = "structural"
+    CODE = "code"
 
 
-# ============================================================================
-# VALIDATOR AGENT
-# ============================================================================
+@dataclass
+class RetrievalResult:
+    """Data class for retrieval results"""
+    content: str
+    score: float
+    metadata: Dict
+    strategy: SearchStrategy
 
-class TerraformValidator:
-    """Comprehensive Terraform code validator"""
+
+@dataclass
+class ValidationResult:
+    """Data class for validation results"""
+    is_valid: bool
+    issues: List[str]
+    suggestions: List[str]
+    score: float
+
+
+class PineconeIndex():
+    """
+    Pinecone Index class for vector store operations.
+    """
+    def __init__(self, PINECONE_API_KEY, PINECONE_ENVIRONMENT, index_name):
+        self.pinecone = Pinecone(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+        self.index = self.pinecone.Index(index_name)
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    def retrieve_index(self, prompt, top_k=5, namespace=None):
+        """Retrieve top_k similar items from the index"""
+        query_vector = self.embedding_model.encode([prompt]).tolist()[0]
+        results = self.index.query(
+            vector=query_vector, 
+            top_k=top_k, 
+            include_metadata=True,
+            namespace=namespace
+        )
+        return results
+
+
+class MultiStrategyRetrieval():
+    """
+    Layer 3: Multi-Strategy Retrieval System
+    Implements semantic, structural, and code-based search strategies
+    """
+    def __init__(self, pinecone_index: PineconeIndex, ollama_model: str):
+        self.pinecone_index = pinecone_index
+        self.ollama_model = ollama_model
+        
+    def semantic_search(self, query: str, top_k: int = 5) -> List[RetrievalResult]:
+        """Semantic search using vector embeddings"""
+        print("  🔍 Performing semantic search...")
+        results = self.pinecone_index.retrieve_index(query, top_k=top_k)
+        
+        retrieval_results = []
+        for match in results.get('matches', []):
+            retrieval_results.append(RetrievalResult(
+                content=match.get('metadata', {}).get('text', ''),
+                score=match.get('score', 0.0),
+                metadata=match.get('metadata', {}),
+                strategy=SearchStrategy.SEMANTIC
+            ))
+        return retrieval_results
     
-    def __init__(self, terraform_file: str):
-        self.terraform_file = pathlib.Path(terraform_file)
-        self.terraform_dir = self.terraform_file.parent
-        self.validation_results = {
-            "syntax_check": {},
-            "security_check": {},
-            "llm_review": {},
-            "overall_status": "PENDING"
-        }
+    def structural_search(self, resource_type: str, top_k: int = 3) -> List[RetrievalResult]:
+        """Search for structural templates and module patterns"""
+        print("  🏗️  Performing structural search...")
+        
+        # Search for resource-specific templates
+        query = f"terraform module structure {resource_type} best practices"
+        results = self.pinecone_index.retrieve_index(query, top_k=top_k, namespace="templates")
+        
+        retrieval_results = []
+        for match in results.get('matches', []):
+            retrieval_results.append(RetrievalResult(
+                content=match.get('metadata', {}).get('text', ''),
+                score=match.get('score', 0.0),
+                metadata=match.get('metadata', {}),
+                strategy=SearchStrategy.STRUCTURAL
+            ))
+        return retrieval_results
     
-    def validate_all(self) -> Dict:
-        """Run all validation checks"""
-        print("\n" + "="*60)
-        print("🔍 TERRAFORM VALIDATION AGENT")
-        print("="*60)
+    def code_search(self, query: str, top_k: int = 3) -> List[RetrievalResult]:
+        """Search for similar code implementations"""
+        print("  💻 Performing code search...")
         
-        # 1. Syntax Validation
-        print("\n[1/4] Running syntax validation...")
-        self.validation_results["syntax_check"] = self._validate_syntax()
+        # Search specifically in code namespace
+        code_query = f"terraform code implementation {query}"
+        results = self.pinecone_index.retrieve_index(code_query, top_k=top_k, namespace="code")
         
-        # 2. Security Best Practices
-        print("\n[2/4] Checking security best practices...")
-        self.validation_results["security_check"] = self._check_security()
-        
-        # 3. LLM-based Code Review
-        print("\n[3/4] Running LLM code review...")
-        self.validation_results["llm_review"] = self._llm_code_review()
-        
-        # 4. Generate Overall Status
-        print("\n[4/4] Generating overall assessment...")
-        self._generate_overall_status()
-        
-        # Print Summary
-        self._print_summary()
-        
-        return self.validation_results
+        retrieval_results = []
+        for match in results.get('matches', []):
+            retrieval_results.append(RetrievalResult(
+                content=match.get('metadata', {}).get('text', ''),
+                score=match.get('score', 0.0),
+                metadata=match.get('metadata', {}),
+                strategy=SearchStrategy.CODE
+            ))
+        return retrieval_results
     
-    def _validate_syntax(self) -> Dict:
-        """Validate Terraform syntax using terraform validate"""
-        result = {
-            "status": "UNKNOWN",
-            "message": "",
-            "details": []
-        }
+    def multi_strategy_retrieve(self, query: str, resource_type: str) -> List[RetrievalResult]:
+        """Combine all search strategies"""
+        print("\n📚 LAYER 3: Multi-Strategy Retrieval\n")
         
-        if not self._is_terraform_installed():
-            result["status"] = "SKIPPED"
-            result["message"] = "Terraform CLI not found. Install Terraform to run syntax validation."
-            return result
+        semantic_results = self.semantic_search(query, top_k=5)
+        structural_results = self.structural_search(resource_type, top_k=3)
+        code_results = self.code_search(query, top_k=3)
+        
+        all_results = semantic_results + structural_results + code_results
+        print(f"  ✓ Retrieved {len(all_results)} total results\n")
+        
+        return all_results
+
+
+class IntelligentReranker():
+    """
+    Layer 4: Intelligent Re-ranking & Validation
+    Re-ranks results based on relevance, security, and context
+    """
+    def __init__(self, ollama_model: str):
+        self.ollama_model = ollama_model
+    
+    def relevance_scoring(self, query: str, results: List[RetrievalResult]) -> List[RetrievalResult]:
+        """Score results based on relevance to the query"""
+        print("  📊 Scoring relevance...")
+        
+        prompt = f"""Rate the relevance of each document to this query: "{query}"
+        
+Documents:
+{self._format_results_for_scoring(results)}
+
+Respond with JSON array of scores (0-1) for each document:
+{{"scores": [0.9, 0.7, ...]}}
+"""
+        
+        response = ollama.generate(model=self.ollama_model, prompt=prompt)
         
         try:
-            # Initialize terraform
-            init_result = subprocess.run(
-                ["terraform", "init", "-backend=false"],
-                cwd=self.terraform_dir,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            # Run terraform validate
-            validate_result = subprocess.run(
-                ["terraform", "validate", "-json"],
-                cwd=self.terraform_dir,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            try:
-                validation_output = json.loads(validate_result.stdout)
-                if validation_output.get("valid", False):
-                    result["status"] = "PASS"
-                    result["message"] = "✅ Terraform syntax is valid"
-                else:
-                    result["status"] = "FAIL"
-                    result["message"] = "❌ Terraform validation failed"
-                    result["details"] = validation_output.get("diagnostics", [])
-            except json.JSONDecodeError:
-                result["status"] = "ERROR"
-                result["message"] = f"Failed to parse terraform output: {validate_result.stdout}"
+            json_match = re.search(r'\{.*\}', response['response'], re.DOTALL)
+            if json_match:
+                scores_data = json.loads(json_match.group())
+                scores = scores_data.get('scores', [])
                 
-        except subprocess.TimeoutExpired:
-            result["status"] = "ERROR"
-            result["message"] = "Terraform validation timed out"
-        except Exception as e:
-            result["status"] = "ERROR"
-            result["message"] = f"Error during validation: {str(e)}"
+                for i, result in enumerate(results):
+                    if i < len(scores):
+                        result.score = (result.score + scores[i]) / 2
+        except:
+            pass
         
-        return result
+        return sorted(results, key=lambda x: x.score, reverse=True)
     
-    def _check_security(self) -> Dict:
-        """Check for common security issues"""
-        result = {
-            "status": "PASS",
-            "issues_found": [],
-            "warnings": []
-        }
+    def security_validation(self, results: List[RetrievalResult]) -> List[RetrievalResult]:
+        """Validate security aspects of retrieved content"""
+        print("  🔒 Validating security...")
         
-        try:
-            terraform_code = self.terraform_file.read_text(encoding="utf-8")
-        except Exception as e:
-            result["status"] = "ERROR"
-            result["issues_found"].append(f"Could not read file: {str(e)}")
-            return result
-        
-        security_patterns = [
-            {
-                "pattern": r'encryption\s*=\s*false',
-                "issue": "Encryption disabled",
-                "severity": "HIGH"
-            },
-            {
-                "pattern": r'public_access_block\s*=\s*false',
-                "issue": "Public access block disabled",
-                "severity": "HIGH"
-            },
-            {
-                "pattern": r'acl\s*=\s*["\']public-read',
-                "issue": "Public read ACL configured",
-                "severity": "HIGH"
-            },
-            {
-                "pattern": r'versioning\s*{[^}]*enabled\s*=\s*false',
-                "issue": "Versioning disabled",
-                "severity": "MEDIUM"
-            },
-            {
-                "pattern": r'(aws_access_key|aws_secret|password)\s*=\s*["\'][^"\']+["\']',
-                "issue": "Hardcoded credentials detected",
-                "severity": "CRITICAL"
-            },
-        ]
-        
-        for check in security_patterns:
-            matches = re.finditer(check["pattern"], terraform_code, re.IGNORECASE | re.DOTALL)
-            for match in matches:
-                issue = {
-                    "severity": check["severity"],
-                    "issue": check["issue"],
-                    "location": f"Line {terraform_code[:match.start()].count(chr(10)) + 1}"
-                }
-                result["issues_found"].append(issue)
-                if check["severity"] in ["HIGH", "CRITICAL"]:
-                    result["status"] = "FAIL"
-        
-        if result["status"] == "PASS" and not result["issues_found"]:
-            result["message"] = "✅ No security issues detected"
-        else:
-            result["message"] = f"❌ Found {len(result['issues_found'])} security issues"
-        
-        return result
-    
-    def _llm_code_review(self) -> Dict:
-        """Use Gemini for code review"""
-        result = {
-            "status": "PENDING",
-            "review": "",
-            "suggestions": [],
-            "issues": [],
-            "security_concerns": [],
-            "score": 0
-        }
-        
-        try:
-            terraform_code = self.terraform_file.read_text(encoding="utf-8")
+        validated_results = []
+        for result in results:
+            # Check for security best practices
+            content_lower = result.content.lower()
+            security_score = 1.0
             
-            prompt = f"""
-You are an expert Terraform and AWS infrastructure reviewer. Analyze the following Terraform code.
+            # Penalize insecure patterns
+            if 'hardcoded' in content_lower or 'password' in content_lower:
+                security_score -= 0.3
+            if 'public' in content_lower and 'bucket' in content_lower:
+                security_score -= 0.2
+            
+            # Reward secure patterns
+            if 'encryption' in content_lower or 'kms' in content_lower:
+                security_score += 0.1
+            if 'iam' in content_lower or 'policy' in content_lower:
+                security_score += 0.1
+            
+            result.score = result.score * security_score
+            validated_results.append(result)
+        
+        return validated_results
+    
+    def select_best_context(self, results: List[RetrievalResult], max_context: int = 5) -> List[RetrievalResult]:
+        """Select the best context from re-ranked results"""
+        print("  ✂️  Selecting best context...")
+        
+        # Return top N results
+        selected = results[:max_context]
+        print(f"  ✓ Selected {len(selected)} best results\n")
+        
+        return selected
+    
+    def rerank_and_validate(self, query: str, results: List[RetrievalResult]) -> List[RetrievalResult]:
+        """Complete re-ranking and validation pipeline"""
+        print("\n🎯 LAYER 4: Intelligent Re-ranking & Validation\n")
+        
+        results = self.relevance_scoring(query, results)
+        results = self.security_validation(results)
+        results = self.select_best_context(results, max_context=5)
+        
+        return results
+    
+    def _format_results_for_scoring(self, results: List[RetrievalResult]) -> str:
+        """Format results for LLM scoring"""
+        formatted = []
+        for i, result in enumerate(results):
+            formatted.append(f"Document {i+1}:\n{result.content[:300]}...")
+        return "\n\n".join(formatted)
 
-TERRAFORM CODE:
-```hcl
+
+class MultiAgentGeneration():
+    """
+    Layer 5: Multi-Agent Generation System
+    Specialized agents for different aspects of code generation
+    """
+    def __init__(self, ollama_model: str):
+        self.ollama_model = ollama_model
+    
+    def generator_agent(self, query: str, context: List[RetrievalResult], 
+                       variables: Dict) -> str:
+        """Main generator agent - creates Terraform code"""
+        print("  🤖 Generator Agent: Creating Terraform code...")
+        
+        context_text = self._format_context(context)
+        variables_text = json.dumps(variables, indent=2)
+        
+        prompt = f"""You are a Terraform expert. Generate clean, production-ready Terraform code.
+
+User Request: {query}
+
+User Variables:
+{variables_text}
+
+Reference Context:
+{context_text}
+
+Generate complete Terraform code with:
+1. Proper resource definitions
+2. Variable declarations
+3. Output definitions
+4. Comments explaining key decisions
+
+Return ONLY the Terraform code, no explanations.
+"""
+        
+        response = ollama.generate(model=self.ollama_model, prompt=prompt)
+        return response['response']
+    
+    def validator_agent(self, terraform_code: str) -> ValidationResult:
+        """Validator agent - checks code correctness"""
+        print("  ✅ Validator Agent: Checking correctness...")
+        
+        prompt = f"""Review this Terraform code for correctness:
+
 {terraform_code}
-```
 
-Provide your review in JSON format:
+Check for:
+1. Syntax errors
+2. Missing required arguments
+3. Proper resource naming
+4. Variable usage
+
+Respond in JSON format:
 {{
-    "overall_score": <1-10>,
-    "issues": ["list of problems"],
+    "is_valid": true/false,
+    "issues": ["list of issues"],
     "suggestions": ["list of improvements"],
-    "security_concerns": ["list of security issues"],
-    "summary": "brief assessment"
+    "score": 0.0-1.0
 }}
 """
-            
-            llm = genai.GenerativeModel("gemini-2.5-flash")
-            response = llm.generate_content(prompt)
-            
-            review_text = response.text if hasattr(response, "text") else str(response)
-            
-            # Extract JSON
-            json_match = re.search(r'\{.*\}', review_text, re.DOTALL)
+        
+        response = ollama.generate(model=self.ollama_model, prompt=prompt)
+        
+        try:
+            json_match = re.search(r'\{.*\}', response['response'], re.DOTALL)
             if json_match:
-                review_json = json.loads(json_match.group())
-                result["score"] = review_json.get("overall_score", 5)
-                result["suggestions"] = review_json.get("suggestions", [])
-                result["issues"] = review_json.get("issues", [])
-                result["security_concerns"] = review_json.get("security_concerns", [])
-                result["review"] = review_json.get("summary", review_text)
-            else:
-                result["review"] = review_text
-                result["score"] = 5
-            
-            # Determine status
-            if result["score"] >= 8:
-                result["status"] = "EXCELLENT"
-            elif result["score"] >= 6:
-                result["status"] = "GOOD"
-            elif result["score"] >= 4:
-                result["status"] = "NEEDS_IMPROVEMENT"
-            else:
-                result["status"] = "POOR"
-                
-        except Exception as e:
-            result["status"] = "ERROR"
-            result["review"] = f"Error during LLM review: {str(e)}"
-        
-        return result
-    
-    def _generate_overall_status(self):
-        """Generate overall validation status"""
-        syntax = self.validation_results["syntax_check"].get("status")
-        security = self.validation_results["security_check"].get("status")
-        llm = self.validation_results["llm_review"].get("status")
-        
-        if syntax == "FAIL" or security == "FAIL":
-            self.validation_results["overall_status"] = "FAILED"
-        elif llm in ["POOR", "NEEDS_IMPROVEMENT"]:
-            self.validation_results["overall_status"] = "NEEDS_IMPROVEMENT"
-        elif syntax == "PASS" and security == "PASS":
-            self.validation_results["overall_status"] = "PASSED"
-        else:
-            self.validation_results["overall_status"] = "PARTIAL"
-    
-    def _print_summary(self):
-        """Print validation summary"""
-        print("\n" + "="*60)
-        print("📊 VALIDATION SUMMARY")
-        print("="*60)
-        
-        status = self.validation_results["overall_status"]
-        status_emoji = "✅" if status == "PASSED" else "⚠️" if status == "PARTIAL" else "❌"
-        print(f"\n{status_emoji} Overall Status: {status}")
-        
-        print(f"\n🔧 Syntax: {self.validation_results['syntax_check'].get('status')}")
-        print(f"🔒 Security: {self.validation_results['security_check'].get('status')}")
-        print(f"🤖 LLM Review: {self.validation_results['llm_review'].get('status')} (Score: {self.validation_results['llm_review'].get('score', 0)}/10)")
-        
-        issues = self.validation_results['security_check'].get('issues_found', [])
-        if issues:
-            print(f"\n⚠️  Security Issues Found: {len(issues)}")
-            for issue in issues[:3]:
-                print(f"   • [{issue['severity']}] {issue['issue']}")
-        
-        print("="*60)
-    
-    def _is_terraform_installed(self) -> bool:
-        """Check if terraform CLI is available"""
-        try:
-            subprocess.run(["terraform", "version"], capture_output=True, timeout=5)
-            return True
+                result_data = json.loads(json_match.group())
+                return ValidationResult(
+                    is_valid=result_data.get('is_valid', True),
+                    issues=result_data.get('issues', []),
+                    suggestions=result_data.get('suggestions', []),
+                    score=result_data.get('score', 0.8)
+                )
         except:
-            return False
-
-
-# ============================================================================
-# GENERATOR AGENT
-# ============================================================================
-
-def get_embedding(text: str) -> List[float]:
-    """Generate embedding vector"""
-    return embedder.encode(text).tolist()
-
-
-def retrieve_docs(query: str, top_k: int = 5):
-    """Retrieve relevant Terraform docs from Pinecone"""
-    query_embedding = get_embedding(query)
-    results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
-    return results
-
-
-def generate_terraform_code(query: str, retrieved_docs, validation_feedback: Optional[Dict] = None, previous_code: Optional[str] = None) -> str:
-    """Generate Terraform code with optional validation feedback"""
-    matches = retrieved_docs.matches if hasattr(retrieved_docs, 'matches') else []
-    
-    context = "\n".join(
-        [match.metadata.get("text", "") if hasattr(match, 'metadata') else "" for match in matches]
-    )
-
-    if validation_feedback and previous_code:
-        feedback_summary = _format_validation_feedback(validation_feedback)
+            pass
         
-        prompt = f"""
-You are an expert in Terraform and AWS Infrastructure as Code.
+        return ValidationResult(is_valid=True, issues=[], suggestions=[], score=0.8)
+    
+    def security_agent(self, terraform_code: str) -> ValidationResult:
+        """Security agent - identifies security issues"""
+        print("  🔐 Security Agent: Analyzing security...")
+        
+        prompt = f"""Analyze this Terraform code for security issues:
 
-PREVIOUS ATTEMPT HAD ISSUES. You must fix the following problems:
+{terraform_code}
 
-{feedback_summary}
+Check for:
+1. Hardcoded secrets
+2. Public access configurations
+3. Missing encryption
+4. IAM policy issues
+5. Network security concerns
 
-PREVIOUS CODE (WITH ERRORS):
-```hcl
-{previous_code}
-```
-
-Using the following Terraform documentation:
-{context}
-
-Original user request: '{query}'
-
-Generate a CORRECTED, production-ready Terraform configuration that:
-1. FIXES all validation errors mentioned above
-2. ADDRESSES all security issues
-3. IMPLEMENTS all suggestions from the code review
-4. Follows AWS and Terraform best practices
-5. Includes proper comments
-
-IMPORTANT: Only provide the corrected Terraform code without any additional explanations.
+Respond in JSON format:
+{{
+    "is_valid": true/false,
+    "issues": ["list of security issues"],
+    "suggestions": ["list of security improvements"],
+    "score": 0.0-1.0
+}}
 """
-    else:
-        prompt = f"""
-You are an expert in Terraform and AWS Infrastructure as Code.
-
-Using the following retrieved Terraform documentation snippets:
-{context}
-
-Generate a complete, production-ready Terraform configuration that satisfies this user request:
-'{query}'
-
-Make sure:
-- The Terraform code follows best practices
-- Uses appropriate AWS resources and variables
-- Includes comments for clarity
-- Implements security best practices (encryption, private access, versioning)
-- Uses proper resource naming and tagging
-- Just provide the Terraform code without any additional explanations
-"""
-
-    llm = genai.GenerativeModel("gemini-2.5-flash")
-    response = llm.generate_content(prompt)
-    
-    terraform_text = ""
-    if hasattr(response, "text") and response.text:
-        terraform_text = response.text
-    elif getattr(response, "output", None):
-        terraform_text = getattr(response, "output_text", "") or str(response.output)
-    else:
-        terraform_text = str(response)
-
-    terraform_text = _clean_code_output(terraform_text)
-    return terraform_text
-
-
-def _format_validation_feedback(validation_results: Dict) -> str:
-    """Format validation results into readable feedback"""
-    feedback_parts = []
-    
-    # Syntax errors
-    syntax = validation_results.get("syntax_check", {})
-    if syntax.get("status") == "FAIL":
-        feedback_parts.append("SYNTAX ERRORS:")
-        for detail in syntax.get("details", [])[:5]:
-            feedback_parts.append(f"  - {detail.get('summary', 'Unknown error')}")
-    
-    # Security issues
-    security = validation_results.get("security_check", {})
-    issues = security.get("issues_found", [])
-    if issues:
-        feedback_parts.append("\nSECURITY ISSUES:")
-        for issue in issues[:10]:
-            feedback_parts.append(f"  - [{issue['severity']}] {issue['issue']} at {issue['location']}")
-    
-    # LLM review
-    llm_review = validation_results.get("llm_review", {})
-    if llm_review.get("issues"):
-        feedback_parts.append("\nCODE REVIEW ISSUES:")
-        for issue in llm_review["issues"][:5]:
-            feedback_parts.append(f"  - {issue}")
-    
-    if llm_review.get("suggestions"):
-        feedback_parts.append("\nIMPROVEMENT SUGGESTIONS:")
-        for suggestion in llm_review["suggestions"][:5]:
-            feedback_parts.append(f"  - {suggestion}")
-    
-    if llm_review.get("security_concerns"):
-        feedback_parts.append("\nSECURITY CONCERNS:")
-        for concern in llm_review["security_concerns"][:5]:
-            feedback_parts.append(f"  - {concern}")
-    
-    return "\n".join(feedback_parts) if feedback_parts else "Minor improvements needed."
-
-
-def _clean_code_output(code: str) -> str:
-    """Remove markdown code blocks"""
-    code = code.replace("```hcl", "").replace("```terraform", "").replace("```", "")
-    return code.strip()
-
-
-def save_terraform_to_file(terraform_code: str, base_dir: str = "generated", filename: str = "main.tf") -> str:
-    """Save terraform code to file"""
-    out_dir = pathlib.Path(base_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / filename
-    out_path.write_text(terraform_code, encoding="utf-8")
-    print(f"✅ Written Terraform to: {out_path.resolve()}")
-
-    if shutil.which("terraform"):
+        
+        response = ollama.generate(model=self.ollama_model, prompt=prompt)
+        
         try:
-            subprocess.run(["terraform", "fmt", str(out_path)], check=True, capture_output=True)
-            print("✅ Ran `terraform fmt` on the generated file.")
-        except subprocess.CalledProcessError as e:
-            print("⚠️ terraform fmt failed:", e.stderr.decode() if e.stderr else e)
-
-    return str(out_path.resolve())
-
-
-# ============================================================================
-# MAIN FEEDBACK LOOP
-# ============================================================================
-
-def rag_generate_terraform_with_validation(query: str, out_dir: str = "generated", max_iterations: int = 3):
-    """Generate Terraform code with validation feedback loop"""
-    print("\n" + "="*70)
-    print("🚀 TERRAFORM GENERATION WITH VALIDATION FEEDBACK LOOP")
-    print("="*70)
-    
-    iteration = 0
-    validation_results = None
-    terraform_code = None
-    saved_path = None
-    retrieved_docs = None
-    
-    while iteration < max_iterations:
-        iteration += 1
-        print(f"\n{'='*70}")
-        print(f"🔄 ITERATION {iteration}/{max_iterations}")
-        print(f"{'='*70}")
+            json_match = re.search(r'\{.*\}', response['response'], re.DOTALL)
+            if json_match:
+                result_data = json.loads(json_match.group())
+                return ValidationResult(
+                    is_valid=result_data.get('is_valid', True),
+                    issues=result_data.get('issues', []),
+                    suggestions=result_data.get('suggestions', []),
+                    score=result_data.get('score', 0.8)
+                )
+        except:
+            pass
         
-        # Step 1: Generate or Regenerate Code
-        if iteration == 1:
-            print(f"\n🔍 Query: {query}")
-            retrieved_docs = retrieve_docs(query)
-            matches_count = len(retrieved_docs.matches) if hasattr(retrieved_docs, 'matches') else 0
-            print(f"✅ Retrieved {matches_count} relevant documents.")
+        return ValidationResult(is_valid=True, issues=[], suggestions=[], score=0.8)
+    
+    def cost_optimizer_agent(self, terraform_code: str) -> ValidationResult:
+        """Cost optimizer agent - suggests cost optimizations"""
+        print("  💰 Cost Optimizer Agent: Analyzing costs...")
+        
+        prompt = f"""Analyze this Terraform code for cost optimization:
+
+{terraform_code}
+
+Check for:
+1. Over-provisioned resources
+2. Missing cost-saving features (spot instances, reserved capacity)
+3. Unnecessary data transfer costs
+4. Storage optimization opportunities
+
+Respond in JSON format:
+{{
+    "is_valid": true/false,
+    "issues": ["list of cost issues"],
+    "suggestions": ["list of cost optimizations"],
+    "score": 0.0-1.0
+}}
+"""
+        
+        response = ollama.generate(model=self.ollama_model, prompt=prompt)
+        
+        try:
+            json_match = re.search(r'\{.*\}', response['response'], re.DOTALL)
+            if json_match:
+                result_data = json.loads(json_match.group())
+                return ValidationResult(
+                    is_valid=result_data.get('is_valid', True),
+                    issues=result_data.get('issues', []),
+                    suggestions=result_data.get('suggestions', []),
+                    score=result_data.get('score', 0.8)
+                )
+        except:
+            pass
+        
+        return ValidationResult(is_valid=True, issues=[], suggestions=[], score=0.8)
+    
+    def generate_with_agents(self, query: str, context: List[RetrievalResult], 
+                            variables: Dict) -> Tuple[str, Dict[str, ValidationResult]]:
+        """Orchestrate all agents"""
+        print("\n🤖 LAYER 5: Multi-Agent Generation\n")
+        
+        # Generate code
+        terraform_code = self.generator_agent(query, context, variables)
+        
+        # Validate with specialized agents
+        validation_results = {
+            'validator': self.validator_agent(terraform_code),
+            'security': self.security_agent(terraform_code),
+            'cost_optimizer': self.cost_optimizer_agent(terraform_code)
+        }
+        
+        return terraform_code, validation_results
+    
+    def _format_context(self, context: List[RetrievalResult]) -> str:
+        """Format context for generation"""
+        formatted = []
+        for i, result in enumerate(context):
+            formatted.append(f"Reference {i+1}:\n{result.content}")
+        return "\n\n".join(formatted)
+
+
+class ReflectionQA():
+    """
+    Layer 6: Reflection & Quality Assurance
+    Self-critique and iterative refinement
+    """
+    def __init__(self, ollama_model: str):
+        self.ollama_model = ollama_model
+    
+    def self_critique(self, terraform_code: str, validation_results: Dict[str, ValidationResult]) -> Dict:
+        """Perform self-critique on generated code"""
+        print("  🔍 Performing self-critique...")
+        
+        all_issues = []
+        all_suggestions = []
+        
+        for agent_name, result in validation_results.items():
+            all_issues.extend(result.issues)
+            all_suggestions.extend(result.suggestions)
+        
+        prompt = f"""Perform a critical review of this Terraform code:
+
+{terraform_code}
+
+Known Issues:
+{json.dumps(all_issues, indent=2)}
+
+Suggestions:
+{json.dumps(all_suggestions, indent=2)}
+
+Provide a comprehensive critique in JSON format:
+{{
+    "overall_quality": 0.0-1.0,
+    "strengths": ["list of strengths"],
+    "weaknesses": ["list of weaknesses"],
+    "must_fix": ["critical issues that must be fixed"],
+    "improvements": ["suggested improvements"]
+}}
+"""
+        
+        response = ollama.generate(model=self.ollama_model, prompt=prompt)
+        
+        try:
+            json_match = re.search(r'\{.*\}', response['response'], re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        except:
+            pass
+        
+        return {
+            "overall_quality": 0.8,
+            "strengths": [],
+            "weaknesses": [],
+            "must_fix": [],
+            "improvements": []
+        }
+    
+    def iterative_refinement(self, terraform_code: str, critique: Dict, 
+                            context: List[RetrievalResult], variables: Dict) -> str:
+        """Refine code based on critique"""
+        print("  ✨ Performing iterative refinement...")
+        
+        if not critique.get('must_fix') and not critique.get('improvements'):
+            return terraform_code
+        
+        context_text = self._format_context(context)
+        variables_text = json.dumps(variables, indent=2)
+        
+        prompt = f"""Refine this Terraform code based on the critique:
+
+Original Code:
+{terraform_code}
+
+Critique:
+{json.dumps(critique, indent=2)}
+
+Reference Context:
+{context_text}
+
+User Variables:
+{variables_text}
+
+Generate improved Terraform code that addresses all issues and improvements.
+Return ONLY the refined Terraform code.
+"""
+        
+        response = ollama.generate(model=self.ollama_model, prompt=prompt)
+        return response['response']
+    
+    def generate_tests(self, terraform_code: str) -> str:
+        """Generate test cases for the Terraform code"""
+        print("  🧪 Generating test cases...")
+        
+        prompt = f"""Generate Terratest or basic test cases for this Terraform code:
+
+{terraform_code}
+
+Create tests that verify:
+1. Resources are created correctly
+2. Outputs are accessible
+3. Security configurations are correct
+4. Resource dependencies work
+
+Return test code in Go (Terratest) or a test plan.
+"""
+        
+        response = ollama.generate(model=self.ollama_model, prompt=prompt)
+        return response['response']
+    
+    def reflection_qa_pipeline(self, terraform_code: str, validation_results: Dict[str, ValidationResult],
+                               context: List[RetrievalResult], variables: Dict, 
+                               max_iterations: int = 2) -> Tuple[str, str]:
+        """Complete reflection and QA pipeline"""
+        print("\n🔄 LAYER 6: Reflection & Quality Assurance\n")
+        
+        current_code = terraform_code
+        
+        for iteration in range(max_iterations):
+            print(f"  🔁 Iteration {iteration + 1}/{max_iterations}")
             
-            terraform_code = generate_terraform_code(query, retrieved_docs)
-            print("\n💡 Generated initial Terraform code")
-        else:
-            print(f"\n🔧 Regenerating code based on validation feedback...")
-            terraform_code = generate_terraform_code(
-                query, 
-                retrieved_docs, 
-                validation_feedback=validation_results,
-                previous_code=terraform_code
-            )
-            print("✅ Regenerated Terraform code with fixes")
+            # Self-critique
+            critique = self.self_critique(current_code, validation_results)
+            
+            # Check if refinement is needed
+            if critique.get('overall_quality', 0) >= 0.9 and not critique.get('must_fix'):
+                print(f"  ✓ Code quality sufficient (score: {critique.get('overall_quality')})")
+                break
+            
+            # Refine
+            current_code = self.iterative_refinement(current_code, critique, context, variables)
         
-        # Step 2: Save the code
-        saved_path = save_terraform_to_file(terraform_code, base_dir=out_dir, filename="main.tf")
+        # Generate tests
+        test_code = self.generate_tests(current_code)
         
-        # Step 3: Validate the code
-        print("\n🔍 Running validation checks...")
-        validator = TerraformValidator(saved_path)
-        validation_results = validator.validate_all()
+        print(f"  ✓ Reflection complete\n")
         
-        # Step 4: Check if validation passed
-        overall_status = validation_results.get("overall_status", "UNKNOWN")
-        
-        if overall_status == "PASSED":
-            print("\n" + "="*70)
-            print("✅ SUCCESS! Terraform code passed all validations!")
-            print("="*70)
-            break
-        elif iteration < max_iterations:
-            print(f"\n⚠️ Validation found issues. Attempting to fix... ({iteration}/{max_iterations})")
-        else:
-            print("\n" + "="*70)
-            print(f"❌ Maximum iterations ({max_iterations}) reached.")
-            print("Code generated but may still have issues. Manual review required.")
-            print("="*70)
+        return current_code, test_code
     
-    # Final Summary
-    print("\n" + "="*70)
-    print("📊 FINAL SUMMARY")
-    print("="*70)
-    print(f"Total iterations: {iteration}")
-    print(f"Final status: {validation_results.get('overall_status', 'UNKNOWN')}")
-    print(f"Output file: {saved_path}")
-    
-    # Save iteration history
-    history_file = pathlib.Path(out_dir) / "generation_history.json"
-    history = {
-        "query": query,
-        "iterations": iteration,
-        "final_status": validation_results.get("overall_status"),
-        "validation_results": validation_results
-    }
-    with open(history_file, 'w', encoding='utf-8') as f:
-        json.dump(history, f, indent=2)
-    print(f"Generation history saved to: {history_file}")
-    
-    return {
-        "terraform_file": saved_path,
-        "validation_results": validation_results,
-        "iterations": iteration,
-        "success": overall_status == "PASSED"
-    }
+    def _format_context(self, context: List[RetrievalResult]) -> str:
+        """Format context"""
+        formatted = []
+        for i, result in enumerate(context):
+            formatted.append(f"Reference {i+1}:\n{result.content[:500]}...")
+        return "\n\n".join(formatted)
 
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
+class RAGSystem():
+    """
+    Complete RAG System with all layers integrated
+    """
+    def __init__(self, pinecone_index: PineconeIndex, genai_api_key: str, ollama_model_name: str):
+        self.ollama_model_name = ollama_model_name
+        self.pinecone_index = pinecone_index 
+        self.genai_client = genai.Client(api_key=genai_api_key)
+        
+        # Initialize all layers
+        self.retrieval = MultiStrategyRetrieval(pinecone_index, ollama_model_name)
+        self.reranker = IntelligentReranker(ollama_model_name)
+        self.agents = MultiAgentGeneration(ollama_model_name)
+        self.reflection = ReflectionQA(ollama_model_name)
+
+    def query_understanding_agent(self, user_query: str) -> Dict:
+        """Layer 1: Query Understanding"""
+        print("\n🧠 LAYER 1: Query Understanding\n")
+        print("  Analyzing your request...\n")
+        
+        prompt = f"""Analyze this Terraform infrastructure request and extract:
+1. Resource type (e.g., S3 bucket, EC2 instance, VPC)
+2. Required variables that MUST be collected from the user
+3. Optional configurations mentioned
+
+User Request: {user_query}
+
+Respond in this exact JSON format:
+{{
+    "resource_type": "the main resource to create",
+    "required_variables": ["list", "of", "required", "variables"],
+    "optional_configs": ["list", "of", "optional", "settings"],
+    "clarification_needed": true/false
+}}
+"""
+        response = ollama.generate(model="codellama:7b-instruct", prompt=prompt)
+        
+        try:
+            json_match = re.search(r'\{.*\}', response['response'], re.DOTALL)
+            if json_match:
+                requirements = json.loads(json_match.group())
+                print(f"  ✓ Resource type: {requirements.get('resource_type')}")
+                print(f"  ✓ Required variables: {len(requirements.get('required_variables', []))}\n")
+                return requirements
+        except:
+            pass
+        
+        return {
+            "resource_type": "infrastructure",
+            "required_variables": [],
+            "optional_configs": [],
+            "clarification_needed": True
+        }
+    
+    def collect_user_variables(self, requirements: Dict) -> Dict:
+        """Layer 2: Variable Collection"""
+        print("🔗 LAYER 2: Collecting Required Information\n")
+        
+        user_variables = {}
+        
+        if not requirements['required_variables']:
+            print("  ✓ No additional variables needed\n")
+            return user_variables
+        
+        print("Please provide the following information:\n")
+        
+        for var in requirements['required_variables']:
+            value = input(f"  {var}: ").strip()
+            user_variables[var] = value
+        
+        if requirements['optional_configs']:
+            print("\n📝 Optional configurations (press Enter to skip):\n")
+            for config in requirements['optional_configs']:
+                value = input(f"  {config} [optional]: ").strip()
+                if value:
+                    user_variables[config] = value
+        
+        print(f"\n  ✓ Collected {len(user_variables)} variable(s)\n")
+        return user_variables
+    
+    def generate_terraform_code(self, user_query: str) -> Dict:
+        """Complete pipeline from query to final code"""
+        print("\n" + "="*70)
+        print("🚀 TERRAFORM IaC GENERATION PIPELINE")
+        print("="*70)
+        
+        # Layer 1: Query Understanding
+        requirements = self.query_understanding_agent(user_query)
+        
+        # Layer 2: Variable Collection
+        variables = self.collect_user_variables(requirements)
+        
+        # Layer 3: Multi-Strategy Retrieval
+        retrieval_results = self.retrieval.multi_strategy_retrieve(
+            user_query, 
+            requirements['resource_type']
+        )
+        
+        # Layer 4: Re-ranking & Validation
+        best_context = self.reranker.rerank_and_validate(user_query, retrieval_results)
+        
+        # Layer 5: Multi-Agent Generation
+        terraform_code, validation_results = self.agents.generate_with_agents(
+            user_query, 
+            best_context, 
+            variables
+        )
+        
+        # Layer 6: Reflection & QA
+        final_code, test_code = self.reflection.reflection_qa_pipeline(
+            terraform_code,
+            validation_results,
+            best_context,
+            variables
+        )
+        
+        # Print results
+        self._print_results(final_code, test_code, validation_results)
+        
+        return {
+            'terraform_code': final_code,
+            'test_code': test_code,
+            'validation_results': validation_results,
+            'requirements': requirements,
+            'variables': variables
+        }
+    
+    def _print_results(self, terraform_code: str, test_code: str, 
+                       validation_results: Dict[str, ValidationResult]):
+        """Print final results"""
+        print("\n" + "="*70)
+        print("📄 GENERATED TERRAFORM CODE")
+        print("="*70)
+        print(terraform_code)
+        
+        print("\n" + "="*70)
+        print("📊 VALIDATION SUMMARY")
+        print("="*70)
+        
+        for agent_name, result in validation_results.items():
+            print(f"\n{agent_name.upper()}:")
+            print(f"  Valid: {result.is_valid}")
+            print(f"  Score: {result.score:.2f}")
+            if result.issues:
+                print(f"  Issues: {len(result.issues)}")
+                for issue in result.issues[:3]:
+                    print(f"    - {issue}")
+            if result.suggestions:
+                print(f"  Suggestions: {len(result.suggestions)}")
+                for suggestion in result.suggestions[:3]:
+                    print(f"    - {suggestion}")
+        
+        print("\n" + "="*70)
+        print("🧪 GENERATED TESTS")
+        print("="*70)
+        print(test_code[:500] + "..." if len(test_code) > 500 else test_code)
+        
+        print("\n" + "="*70)
+        print("✅ PIPELINE COMPLETE")
+        print("="*70)
+
+
+def main():
+    """Main execution function"""
+    print("🔧 Initializing Terraform IaC RAG System...\n")
+    
+    # Load environment variables
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+    PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
+    GENAI_API_KEY = os.getenv("GENAI_API_KEY")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "codellama:7b-instruct")
+    
+    # Initialize vector store
+    vector_store = PineconeIndex(
+        PINECONE_API_KEY, 
+        PINECONE_ENVIRONMENT, 
+        index_name="iac-terraform-v2"
+    )
+    
+    # Initialize RAG system
+    rag_system = RAGSystem(
+        pinecone_index=vector_store,
+        genai_api_key=GENAI_API_KEY,
+        ollama_model_name=OLLAMA_MODEL
+    )
+    
+    # Example query
+    user_query = "create an S3 bucket with versioning enabled and lifecycle policies for cost optimization"
+    
+    # Generate Terraform code
+    result = rag_system.generate_terraform_code(user_query)
+    
+    # Optionally save to files
+    save_option = input("\n💾 Save generated code to files? (y/n): ").strip().lower()
+    if save_option == 'y':
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        with open(f"terraform_code_{timestamp}.tf", "w") as f:
+            f.write(result['terraform_code'])
+        
+        with open(f"test_code_{timestamp}.go", "w") as f:
+            f.write(result['test_code'])
+        
+        print(f"\n✅ Files saved with timestamp: {timestamp}")
+
 
 if __name__ == "__main__":
-    user_query = "Create an S3 bucket with versioning and server-side encryption"
-    
-    result = rag_generate_terraform_with_validation(
-        user_query, 
-        out_dir="generated",
-        max_iterations=3
-    )
-    
-    if result["success"]:
-        print("\n🎉 Terraform code is ready for deployment!")
-    else:
-        print("\n⚠️ Please review the generated code manually before deployment.")
+    main()

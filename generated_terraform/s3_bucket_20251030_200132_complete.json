@@ -1,0 +1,6 @@
+{
+  "main_tf": "terraform {\n\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"3.60\"\n    }\n  }\n\n  provider \"aws\" {\n    region = var.region\n  }\n}\n\nresource \"aws_s3_bucket\" \"shuga-bucket\" {\n  bucket        = var.bucket_name\n  acl           = \"private\"\n  force_destroy = true\n  versioning {\n    enabled = var.versioning\n  }\n\n  server_side_encryption_configuration {\n    rule {\n      apply_server_side_encryption_by_default {\n        sse_algorithm = \"aws:kms\"\n      }\n    }\n  }\n}\n",
+  "variables_tf": "variable \"bucket_name\" {}\nvariable \"versioning\" {}\nvariable \"encryption\" {}\nvariable \"lifecycle_rules\" {}\nvariable \"access_log\" {}\nvariable \"website_hosting\" {}\nvariable \"cors_rules\" {}",
+  "outputs_tf": "",
+  "terraform_tfvars": "bucket_name = \"shuga\"\nversioning = true\nencryption = true\nlifecycle_rules = true\naccess_log = false\nwebsite_hosting = true\ncors_rules = false\nregion = \"us-east-1\""
+}

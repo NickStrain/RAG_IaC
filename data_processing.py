@@ -2,15 +2,12 @@ import requests
 import json
 import time
 from typing import List, Dict
-import numpy as np
-from pinecone import Pinecone, ServerlessSpec
 import base64
 from sentence_transformers import SentenceTransformer
 import os
-
 from dotenv import load_dotenv
 import re
-import time
+from pinecone import Pinecone, ServerlessSpec
 
 load_dotenv()
 
@@ -20,11 +17,9 @@ class TerraformRegistryScraper:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        # Add GitHub token if provided to increase rate limits
         if github_token:
             headers['Authorization'] = f'token {github_token}'
         self.session.headers.update(headers)
-        self.base_api_url = "https://registry.terraform.io/v2/providers/hashicorp/aws"
         
     def get_doc_content_from_api(self, path: str) -> str:
         """Get content directly from GitHub API"""
@@ -34,7 +29,6 @@ class TerraformRegistryScraper:
             
             if response.status_code == 200:
                 data = response.json()
-                # Content is base64 encoded in the API response
                 if 'content' in data:
                     content = base64.b64decode(data['content']).decode('utf-8')
                     return content
@@ -62,76 +56,104 @@ class TerraformRegistryScraper:
             print(f"Error fetching raw {path}: {e}")
             return None
     
-    def parse_markdown_doc(self, content: str, name: str, doc_type: str) -> Dict:
-        """Parse markdown documentation"""
+    def extract_code_blocks(self, content: str) -> List[str]:
+        """Extract all code blocks from markdown"""
+        code_blocks = []
         lines = content.split('\n')
-        
-        description = []
-        example = []
-        arguments = []
-        attributes = []
-        in_example = False
-        in_description = True
-        in_arguments = False
-        in_attributes = False
+        in_code_block = False
+        current_block = []
         
         for line in lines:
-            # Skip front matter
+            if line.strip().startswith('```'):
+                if in_code_block:
+                    # End of code block
+                    if current_block:
+                        code_blocks.append('\n'.join(current_block))
+                    current_block = []
+                    in_code_block = False
+                else:
+                    # Start of code block
+                    in_code_block = True
+            elif in_code_block:
+                current_block.append(line)
+        
+        return code_blocks
+    
+    def extract_sections(self, content: str) -> Dict[str, str]:
+        """Extract all major sections from markdown documentation"""
+        lines = content.split('\n')
+        sections = {}
+        current_section = 'introduction'
+        current_content = []
+        
+        for line in lines:
+            # Skip YAML front matter
             if line.strip() == '---':
                 continue
             
-            # Check for sections
-            if '## Argument Reference' in line or '## Arguments' in line:
-                in_arguments = True
-                in_attributes = False
-                in_description = False
-            elif '## Attribute Reference' in line or '## Attributes' in line:
-                in_attributes = True
-                in_arguments = False
-                in_description = False
-            elif line.startswith('## '):
-                in_arguments = False
-                in_attributes = False
+            # Check if this is a header line
+            if line.startswith('## '):
+                # Save previous section
+                if current_content:
+                    sections[current_section] = '\n'.join(current_content).strip()
                 
-            # Extract description (first few non-empty, non-header paragraphs)
-            if in_description and line.strip() and not line.startswith('#') and not line.startswith('```'):
-                if not line.startswith('->') and not line.startswith('~>'):
-                    description.append(line.strip())
-                    if len(description) >= 5:
-                        in_description = False
-            
-            # Extract arguments
-            if in_arguments and line.strip().startswith('*'):
-                arguments.append(line.strip())
-            
-            # Extract attributes
-            if in_attributes and line.strip().startswith('*'):
-                attributes.append(line.strip())
-            
-            # Extract example code
-            if '```' in line:
-                if 'terraform' in line.lower() or 'hcl' in line.lower():
-                    in_example = not in_example
-                elif in_example:
-                    in_example = False
-            elif in_example:
-                example.append(line)
-                if len(example) >= 100:
-                    in_example = False
+                # Start new section
+                current_section = line.replace('## ', '').strip().lower().replace(' ', '_')
+                current_content = []
+            else:
+                current_content.append(line)
+        
+        # Save last section
+        if current_content:
+            sections[current_section] = '\n'.join(current_content).strip()
+        
+        return sections
+    
+    def parse_markdown_doc_comprehensive(self, content: str, name: str, doc_type: str) -> Dict:
+        """Comprehensively parse markdown documentation including all code and sections"""
+        
+        # Extract all code blocks
+        code_blocks = self.extract_code_blocks(content)
+        
+        # Extract all sections
+        sections = self.extract_sections(content)
+        
+        # Get main description (first few paragraphs before first header)
+        lines = content.split('\n')
+        description_lines = []
+        for line in lines:
+            if line.startswith('## '):
+                break
+            if line.strip() and not line.startswith('#') and not line.startswith('```'):
+                if not line.startswith('->') and not line.startswith('~>') and not line.strip() == '---':
+                    description_lines.append(line.strip())
+        
+        description = ' '.join(description_lines[:10]) if description_lines else 'No description available'
+        
+        # Combine all code blocks
+        all_code = '\n\n'.join(code_blocks)
+        
+        # Extract specific sections
+        example_usage = sections.get('example_usage', '')
+        argument_reference = sections.get('argument_reference', '') or sections.get('arguments', '')
+        attribute_reference = sections.get('attribute_reference', '') or sections.get('attributes', '')
         
         return {
             'name': name,
             'type': doc_type,
-            'description': ' '.join(description)[:2000] if description else 'No description available',
-            'example': '\n'.join(example[:100]) if example else '',
-            'arguments': ' '.join(arguments[:50]) if arguments else '',
-            'attributes': ' '.join(attributes[:50]) if attributes else '',
-            'full_text': content[:10000]
+            'description': description[:3000],
+            'example_usage': example_usage[:5000],
+            'all_code_blocks': all_code[:8000],
+            'argument_reference': argument_reference[:5000],
+            'attribute_reference': attribute_reference[:5000],
+            'sections': sections,
+            'full_text': content[:15000],  # Store more of the full text
+            'code_block_count': len(code_blocks)
         }
     
     def scrape_github_docs(self, limit: int = 500, use_api: bool = True) -> List[Dict]:
         """Scrape documentation from GitHub repository"""
-        print("Fetching documentation list from GitHub...")
+        print("Fetching comprehensive documentation from GitHub...")
         
         documents = []
         resources_fetched = 0
@@ -139,7 +161,9 @@ class TerraformRegistryScraper:
         
         try:
             # Get resources
-            print("\nFetching resources list...")
+            print("\n" + "="*70)
+            print("FETCHING RESOURCES")
+            print("="*70)
             resources_url = "https://api.github.com/repos/hashicorp/terraform-provider-aws/contents/website/docs/r"
             response = self.session.get(resources_url, timeout=15)
             
@@ -162,12 +186,12 @@ class TerraformRegistryScraper:
                             content = self.get_doc_content_raw(f"r/{resource['name']}")
                         
                         if content:
-                            doc = self.parse_markdown_doc(content, f"aws_{name}", "resource")
+                            doc = self.parse_markdown_doc_comprehensive(content, f"aws_{name}", "resource")
                             doc['url'] = f"https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/{name}"
                             documents.append(doc)
                             resources_fetched += 1
                             if resources_fetched % 10 == 0:
-                                print(f"✓ Scraped {resources_fetched} resources...")
+                                print(f"✓ Scraped {resources_fetched}/{target_resources} resources...")
                         else:
                             print(f"✗ Failed: aws_{name}")
                         
@@ -176,7 +200,9 @@ class TerraformRegistryScraper:
                 print(f"Failed to get resources list: {response.status_code}")
             
             # Get data sources
-            print(f"\nFetching data sources list...")
+            print("\n" + "="*70)
+            print("FETCHING DATA SOURCES")
+            print("="*70)
             data_sources_url = "https://api.github.com/repos/hashicorp/terraform-provider-aws/contents/website/docs/d"
             response = self.session.get(data_sources_url, timeout=15)
             
@@ -199,12 +225,12 @@ class TerraformRegistryScraper:
                             content = self.get_doc_content_raw(f"d/{ds['name']}")
                         
                         if content:
-                            doc = self.parse_markdown_doc(content, f"aws_{name}", "data_source")
+                            doc = self.parse_markdown_doc_comprehensive(content, f"aws_{name}", "data_source")
                             doc['url'] = f"https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/{name}"
                             documents.append(doc)
                             datasources_fetched += 1
                             if datasources_fetched % 10 == 0:
-                                print(f"✓ Scraped {datasources_fetched} data sources...")
+                                print(f"✓ Scraped {datasources_fetched}/{target_datasources} data sources...")
                         else:
                             print(f"✗ Failed: aws_{name}")
                         
@@ -216,7 +242,9 @@ class TerraformRegistryScraper:
             print(f"Error scraping GitHub: {e}")
         
         print(f"\n{'='*70}")
-        print(f"Summary: Scraped {len(documents)} total documents")
+        print(f"SCRAPING SUMMARY")
+        print(f"{'='*70}")
+        print(f"Total documents scraped: {len(documents)}")
         print(f"  - Resources: {resources_fetched}")
         print(f"  - Data sources: {datasources_fetched}")
         print(f"{'='*70}")
@@ -225,7 +253,7 @@ class TerraformRegistryScraper:
 
 
 class PineconeVectorDatabase:
-    def __init__(self, api_key: str, index_name: str = "terraform-docs", dimension: int = 384):
+    def __init__(self, api_key: str, index_name: str = "iac-terraform-v2", dimension: int = 384):
         """Initialize Pinecone vector database"""
         self.pc = Pinecone(api_key=api_key)
         self.index_name = index_name
@@ -264,31 +292,37 @@ class PineconeVectorDatabase:
             print(f"Index {self.index_name} already exists")
     
     def add_documents(self, documents: List[Dict], batch_size: int = 100):
-        """Add documents to Pinecone"""
+        """Add comprehensive documents to Pinecone"""
         if not documents:
             print("No documents to add!")
             return
         
-        print(f"Adding {len(documents)} documents to Pinecone...")
+        print(f"\n{'='*70}")
+        print(f"ADDING DOCUMENTS TO PINECONE")
+        print(f"{'='*70}")
+        print(f"Total documents to add: {len(documents)}")
         
         vectors_to_upsert = []
         
         for i, doc in enumerate(documents):
-            # Create text for embedding
-            text_to_embed = f"{doc['name']} {doc['type']} {doc['description']} {doc.get('arguments', '')} {doc.get('attributes', '')}"
+            # Create comprehensive text for embedding - include all important content
+            text_to_embed = f"{doc['name']} {doc['type']} {doc['description']} {doc.get('example_usage', '')} {doc.get('argument_reference', '')} {doc.get('attribute_reference', '')}"
             
             # Generate embedding
             embedding = self.model.encode(text_to_embed).tolist()
             
-            # Create metadata (Pinecone has size limits, so we truncate)
+            # Create metadata with all extracted content (respecting Pinecone size limits)
             metadata = {
                 'name': doc['name'],
                 'type': doc['type'],
-                'description': doc['description'][:1000],
+                'description': doc['description'][:2000],
                 'url': doc['url'],
-                'example': doc.get('example', '')[:1000],
-                'arguments': doc.get('arguments', '')[:500],
-                'attributes': doc.get('attributes', '')[:500]
+                'example_usage': doc.get('example_usage', '')[:3000],
+                'all_code_blocks': doc.get('all_code_blocks', '')[:4000],
+                'argument_reference': doc.get('argument_reference', '')[:2000],
+                'attribute_reference': doc.get('attribute_reference', '')[:2000],
+                'code_block_count': doc.get('code_block_count', 0),
+                'full_text_preview': doc.get('full_text', '')[:3000]
             }
             
             # Add to batch
@@ -312,7 +346,11 @@ class PineconeVectorDatabase:
         
         # Get index stats
         stats = self.index.describe_index_stats()
-        print(f"Index now contains {stats['total_vector_count']} vectors")
+        print(f"\n{'='*70}")
+        print(f"INDEX STATISTICS")
+        print(f"{'='*70}")
+        print(f"Total vectors in index: {stats['total_vector_count']}")
+        print(f"{'='*70}")
     
     def search(self, query: str, top_k: int = 5, filter_dict: Dict = None) -> List[Dict]:
         """Search for similar documents"""
@@ -346,7 +384,7 @@ class PineconeVectorDatabase:
 
 def main():
     # Configuration
-    PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')  # Set this as environment variable
+    PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')
     GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')  # Optional: for higher rate limits
     
     if not PINECONE_API_KEY:
@@ -356,12 +394,14 @@ def main():
     
     # Scrape documentation
     print("="*70)
-    print("STEP 1: SCRAPING TERRAFORM DOCUMENTATION")
+    print("TERRAFORM AWS DOCUMENTATION SCRAPER")
+    print("Comprehensive Content Extraction")
     print("="*70)
     
     scraper = TerraformRegistryScraper(github_token=GITHUB_TOKEN)
     
-    # Scrape more documents (500 total: 250 resources + 250 data sources)
+    # Scrape documents (500 total: 250 resources + 250 data sources)
+    # Change use_api=False to avoid rate limits, or use_api=True with GITHUB_TOKEN
     documents = scraper.scrape_github_docs(limit=500, use_api=False)
     
     if not documents:
@@ -374,36 +414,32 @@ def main():
     print(f"\n✓ Successfully scraped {len(documents)} documents")
     
     # Save raw documents as backup
-    with open('terraform_aws_docs.json', 'w', encoding='utf-8') as f:
+    with open('terraform_aws_docs_comprehensive.json', 'w', encoding='utf-8') as f:
         json.dump(documents, f, indent=2)
-    print("✓ Raw documents saved to terraform_aws_docs.json")
+    print(f"✓ Raw documents saved to terraform_aws_docs_comprehensive.json")
     
     # Create and populate Pinecone database
     print("\n" + "="*70)
-    print("STEP 2: CREATING PINECONE VECTOR DATABASE")
+    print("CREATING PINECONE VECTOR DATABASE")
     print("="*70)
     
     vector_db = PineconeVectorDatabase(
         api_key=PINECONE_API_KEY,
-        index_name="terraform-aws-docs"
+        index_name="iac-terraform-v2"
     )
     
     vector_db.add_documents(documents)
     
     # Example searches
     print("\n" + "="*70)
-    print("STEP 3: EXAMPLE SEARCHES")
+    print("EXAMPLE SEARCHES")
     print("="*70)
     
     queries = [
-        "EC2 instance with security groups",
-        "S3 bucket with encryption",
-        "VPC with subnets and routing",
-        "Lambda function with IAM role",
-        "RDS database with multi-az",
-        "CloudWatch alarms and monitoring",
-        "ECS container service",
-        "API Gateway REST API"
+        "S3 bucket with encryption example code",
+        "EC2 instance with security groups terraform",
+        "Lambda function example with IAM role",
+        "VPC configuration with subnets"
     ]
     
     for query in queries:
@@ -416,28 +452,19 @@ def main():
             score = result['score']
             print(f"\n{i}. {metadata['name']} ({metadata['type']}) - Score: {score:.3f}")
             print(f"   URL: {metadata['url']}")
+            print(f"   Code blocks: {metadata.get('code_block_count', 0)}")
             if metadata.get('description'):
-                desc = metadata['description'][:150]
+                desc = metadata['description'][:200]
                 print(f"   Description: {desc}...")
+            
+            # Show a snippet of code if available
+            if metadata.get('all_code_blocks'):
+                code_snippet = metadata['all_code_blocks'][:300]
+                print(f"   Code snippet:\n{code_snippet}...")
     
-    # Search by type filter
     print("\n" + "="*70)
-    print("FILTERED SEARCH EXAMPLE (Resources only)")
+    print("✓ SCRAPING AND INDEXING COMPLETE")
     print("="*70)
-    
-    print(f"\n🔍 Query: 'database' (resources only)")
-    print("-" * 70)
-    results = vector_db.search(
-        "database",
-        top_k=5,
-        filter_dict={"type": {"$eq": "resource"}}
-    )
-    
-    for i, result in enumerate(results, 1):
-        metadata = result['metadata']
-        score = result['score']
-        print(f"{i}. {metadata['name']} - Score: {score:.3f}")
-        print(f"   {metadata['url']}")
 
 
 if __name__ == "__main__":
