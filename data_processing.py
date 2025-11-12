@@ -169,7 +169,7 @@ class TerraformRegistryScraper:
             
             if response.status_code == 200:
                 resources = response.json()
-                target_resources = min(limit // 2, len(resources))
+                target_resources = len(resources)
                 print(f"Found {len(resources)} resources. Scraping up to {target_resources}...")
                 
                 for i, resource in enumerate(resources[:target_resources]):
@@ -208,7 +208,7 @@ class TerraformRegistryScraper:
             
             if response.status_code == 200:
                 data_sources = response.json()
-                target_datasources = min(limit // 2, len(data_sources))
+                target_datasources =len(data_sources)
                 print(f"Found {len(data_sources)} data sources. Scraping up to {target_datasources}...")
                 
                 for i, ds in enumerate(data_sources[:target_datasources]):
@@ -253,7 +253,7 @@ class TerraformRegistryScraper:
 
 
 class PineconeVectorDatabase:
-    def __init__(self, api_key: str, index_name: str = "iac-terraform-v2", dimension: int = 384):
+    def __init__(self, api_key: str, index_name: str = "iac-terraform-v3", dimension: int = 384):
         """Initialize Pinecone vector database"""
         self.pc = Pinecone(api_key=api_key)
         self.index_name = index_name
@@ -402,7 +402,7 @@ def main():
     
     # Scrape documents (500 total: 250 resources + 250 data sources)
     # Change use_api=False to avoid rate limits, or use_api=True with GITHUB_TOKEN
-    documents = scraper.scrape_github_docs(limit=500, use_api=False)
+    documents = scraper.scrape_github_docs(limit=99999, use_api=False)
     
     if not documents:
         print("\n❌ No documents scraped. Possible issues:")
@@ -425,7 +425,7 @@ def main():
     
     vector_db = PineconeVectorDatabase(
         api_key=PINECONE_API_KEY,
-        index_name="iac-terraform-v2"
+        index_name="iac-terraform-v3"
     )
     
     vector_db.add_documents(documents)

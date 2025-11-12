@@ -47,7 +47,7 @@ class PineconeIndex():
         self.index = self.pinecone.Index(index_name)
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-    def retrieve_index(self, prompt, top_k=5, namespace=None):
+    def retrieve_index(self, prompt, top_k=5, namespace="__default__"):
         """Retrieve top_k similar items from the index"""
         query_vector = self.embedding_model.encode([prompt]).tolist()[0]
         results = self.index.query(
@@ -89,7 +89,7 @@ class MultiStrategyRetrieval():
         print("  🏗️  Performing structural search...")
         
         query = f"terraform module structure {resource_type} best practices"
-        results = self.pinecone_index.retrieve_index(query, top_k=top_k, namespace="templates")
+        results = self.pinecone_index.retrieve_index(query, top_k=top_k, namespace="__default__")
         
         retrieval_results = []
         for match in results.get('matches', []):
@@ -106,7 +106,7 @@ class MultiStrategyRetrieval():
         print("  💻 Performing code search...")
         
         code_query = f"terraform code implementation {query}"
-        results = self.pinecone_index.retrieve_index(code_query, top_k=top_k, namespace="code")
+        results = self.pinecone_index.retrieve_index(code_query, top_k=top_k, namespace="__default__")
         
         retrieval_results = []
         for match in results.get('matches', []):
@@ -1110,7 +1110,7 @@ def main():
         vector_store = PineconeIndex(
             PINECONE_API_KEY, 
             PINECONE_ENVIRONMENT, 
-            index_name="iac-terraform-v2"
+            index_name="iac-terraform-v3"
         )
     except Exception as e:
         print(f"❌ Error connecting to Pinecone: {e}")
