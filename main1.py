@@ -54,7 +54,7 @@ class PineconeIndex():
             vector=query_vector, 
             top_k=top_k, 
             include_metadata=True,
-            namespace=namespace
+            
         )
         return results
 
@@ -86,7 +86,7 @@ class MultiStrategyRetrieval():
     
     def structural_search(self, resource_type: str, top_k: int = 3) -> List[RetrievalResult]:
         """Search for structural templates and module patterns"""
-        print("  🏗️  Performing structural search...")
+        print("    Performing structural search...")
         
         query = f"terraform module structure {resource_type} best practices"
         results = self.pinecone_index.retrieve_index(query, top_k=top_k, namespace="__default__")
@@ -103,7 +103,7 @@ class MultiStrategyRetrieval():
     
     def code_search(self, query: str, top_k: int = 3) -> List[RetrievalResult]:
         """Search for similar code implementations"""
-        print("  💻 Performing code search...")
+        print("   Performing code search...")
         
         code_query = f"terraform code implementation {query}"
         results = self.pinecone_index.retrieve_index(code_query, top_k=top_k, namespace="__default__")
@@ -120,14 +120,14 @@ class MultiStrategyRetrieval():
     
     def multi_strategy_retrieve(self, query: str, resource_type: str) -> List[RetrievalResult]:
         """Combine all search strategies"""
-        print("\n📚 LAYER 3: Multi-Strategy Retrieval\n")
+        print("\n LAYER 3: Multi-Strategy Retrieval\n")
         
         semantic_results = self.semantic_search(query, top_k=5)
         structural_results = self.structural_search(resource_type, top_k=3)
         code_results = self.code_search(query, top_k=3)
         
         all_results = semantic_results + structural_results + code_results
-        print(f"  ✓ Retrieved {len(all_results)} total results\n")
+        print(f"   Retrieved {len(all_results)} total results\n")
         
         return all_results
 
@@ -143,7 +143,7 @@ class IntelligentReranker():
     
     def relevance_scoring(self, query: str, results: List[RetrievalResult]) -> List[RetrievalResult]:
         """Score results based on relevance to the query"""
-        print("  📊 Scoring relevance...")
+        print("   Scoring relevance...")
         
         prompt = f"""Rate the relevance of each document to this query: "{query}"
         
@@ -199,16 +199,16 @@ Respond with JSON array of scores (0-1) for each document:
     
     def select_best_context(self, results: List[RetrievalResult], max_context: int = 5) -> List[RetrievalResult]:
         """Select the best context from re-ranked results"""
-        print("  ✂️  Selecting best context...")
+        print("    Selecting best context...")
         
         selected = results[:max_context]
-        print(f"  ✓ Selected {len(selected)} best results\n")
+        print(f"   Selected {len(selected)} best results\n")
         
         return selected
     
     def rerank_and_validate(self, query: str, results: List[RetrievalResult]) -> List[RetrievalResult]:
         """Complete re-ranking and validation pipeline"""
-        print("\n🎯 LAYER 4: Intelligent Re-ranking & Validation\n")
+        print("\n LAYER 4: Intelligent Re-ranking & Validation\n")
         
         results = self.relevance_scoring(query, results)
         results = self.security_validation(results)
@@ -349,7 +349,7 @@ class MultiAgentGeneration():
     def generator_agent(self, query: str, context: List[RetrievalResult], 
                        variables: Dict, max_attempts: int = 3) -> str:
         """Main generator agent with multi-attempt variable enforcement"""
-        print("  🤖 Generator Agent: Creating Terraform code...")
+        print("   Generator Agent: Creating Terraform code...")
         
         # Initialize variable tracker
         self.variable_tracker.add_variables(variables)
@@ -359,7 +359,7 @@ class MultiAgentGeneration():
         
         for attempt in range(max_attempts):
             if attempt > 0:
-                print(f"  🔄 Attempt {attempt + 1}/{max_attempts} - Ensuring all variables are used...")
+                print(f"   Attempt {attempt + 1}/{max_attempts} - Ensuring all variables are used...")
             
             prompt = f"""You are a Terraform code generator. Generate ONLY valid Terraform HCL code.
 
@@ -435,7 +435,7 @@ Corrected complete code:
         # Final check after all attempts
         used_vars, unused_vars = self.variable_tracker.check_usage_in_code(terraform_code)
         if unused_vars:
-            print(f"  ⚠️  WARNING: {len(unused_vars)} variable(s) still missing after {max_attempts} attempts")
+            print(f"    WARNING: {len(unused_vars)} variable(s) still missing after {max_attempts} attempts")
         
         return terraform_code
     
@@ -448,7 +448,7 @@ Corrected complete code:
     
     def validator_agent(self, terraform_code: str, variables: Dict) -> ValidationResult:
         """Validator agent with comprehensive variable checking"""
-        print("  ✅ Validator Agent: Checking correctness...")
+        print("   Validator Agent: Checking correctness...")
         
         # Check variable usage
         used_vars, unused_vars = self.variable_tracker.check_usage_in_code(terraform_code)
@@ -516,7 +516,7 @@ Respond in JSON format:
     
     def security_agent(self, terraform_code: str) -> ValidationResult:
         """Security agent - identifies security issues"""
-        print("  🔐 Security Agent: Analyzing security...")
+        print("   Security Agent: Analyzing security...")
         
         prompt = f"""Analyze this Terraform code for security issues:
 
@@ -560,7 +560,7 @@ Respond in JSON format:
     
     def cost_optimizer_agent(self, terraform_code: str) -> ValidationResult:
         """Cost optimizer agent - suggests cost optimizations"""
-        print("  💰 Cost Optimizer Agent: Analyzing costs...")
+        print("   Cost Optimizer Agent: Analyzing costs...")
         
         prompt = f"""Analyze this Terraform code for cost optimization:
 
@@ -604,7 +604,7 @@ Respond in JSON format:
     def generate_with_agents(self, query: str, context: List[RetrievalResult], 
                             variables: Dict) -> Tuple[str, Dict[str, ValidationResult], VariableTracker]:
         """Orchestrate all agents and return tracker"""
-        print("\n🤖 LAYER 5: Multi-Agent Generation\n")
+        print("\n LAYER 5: Multi-Agent Generation\n")
         
         terraform_code = self.generator_agent(query, context, variables, max_attempts=3)
         
@@ -635,7 +635,7 @@ class ReflectionQA():
     def self_critique(self, terraform_code: str, validation_results: Dict[str, ValidationResult], 
                      variables: Dict, variable_tracker: VariableTracker) -> Dict:
         """Perform self-critique with variable usage analysis"""
-        print("  🔍 Performing self-critique...")
+        print("   Performing self-critique...")
         
         all_issues = []
         all_suggestions = []
@@ -776,12 +776,12 @@ Corrected code with ALL user values:
                                variable_tracker: VariableTracker,
                                max_iterations: int = 4) -> str:
         """Complete reflection and QA pipeline with aggressive variable enforcement"""
-        print("\n🔄 LAYER 6: Reflection & Quality Assurance\n")
+        print("\n LAYER 6: Reflection & Quality Assurance\n")
         
         current_code = terraform_code
         
         for iteration in range(max_iterations):
-            print(f"  🔁 Iteration {iteration + 1}/{max_iterations}")
+            print(f"   Iteration {iteration + 1}/{max_iterations}")
             
             # Update tracker with current code
             variable_tracker.variable_usage_map = {}
@@ -799,7 +799,7 @@ Corrected code with ALL user values:
             if (critique.get('all_variables_used', False) and 
                 critique.get('overall_quality', 0) >= 0.85 and
                 not critique.get('must_fix')):
-                print(f"  ✓ All variables incorporated (quality: {critique.get('overall_quality')})")
+                print(f"   All variables incorporated (quality: {critique.get('overall_quality')})")
                 break
             
             # If variables are missing or quality is low, refine
@@ -814,11 +814,11 @@ Corrected code with ALL user values:
         used_vars, unused_vars = variable_tracker.check_usage_in_code(current_code)
         
         if unused_vars:
-            print(f"  ⚠️  WARNING: {len(unused_vars)} variable(s) still missing after {max_iterations} iterations")
+            print(f"    WARNING: {len(unused_vars)} variable(s) still missing after {max_iterations} iterations")
         else:
-            print(f"  ✓ SUCCESS: All {len(variables)} variables properly incorporated")
+            print(f"   SUCCESS: All {len(variables)} variables properly incorporated")
         
-        print(f"  ✓ Reflection complete\n")
+        print(f"   Reflection complete\n")
         
         return current_code
     
@@ -846,7 +846,7 @@ class RAGSystem():
 
     def query_understanding_agent(self, user_query: str) -> Dict:
         """Layer 1: Query Understanding with value extraction"""
-        print("\n🧠 LAYER 1: Query Understanding\n")
+        print("\n LAYER 1: Query Understanding\n")
         print("  Analyzing your request...\n")
         
         prompt = f"""Analyze this Terraform infrastructure request and extract ALL specific details:
@@ -894,19 +894,19 @@ Return:
             json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
             if json_match:
                 requirements = json.loads(json_match.group())
-                print(f"  ✓ Resource type: {requirements.get('resource_type')}")
-                print(f"  ✓ Values extracted: {len(requirements.get('user_provided_values', {}))}")
+                print(f"   Resource type: {requirements.get('resource_type')}")
+                print(f"   Values extracted: {len(requirements.get('user_provided_values', {}))}")
                 
                 # Display extracted values
                 if requirements.get('user_provided_values'):
-                    print("\n  📋 Extracted from your query:")
+                    print("\n   Extracted from your query:")
                     for key, value in requirements.get('user_provided_values', {}).items():
                         print(f"    • {key}: {value}")
                 
-                print(f"  ✓ Additional info needed: {len(requirements.get('required_variables', []))}\n")
+                print(f"   Additional info needed: {len(requirements.get('required_variables', []))}\n")
                 return requirements
         except Exception as e:
-            print(f"  ⚠️  Error parsing response: {e}")
+            print(f"    Error parsing response: {e}")
         
         return {
             "resource_type": "infrastructure",
@@ -917,13 +917,13 @@ Return:
     
     def collect_user_variables(self, requirements: Dict) -> Dict:
         """Layer 2: Variable Collection with validation"""
-        print("🔗 LAYER 2: Collecting Required Information\n")
+        print(" LAYER 2: Collecting Required Information\n")
         
         # Start with values already extracted
         user_variables = requirements.get('user_provided_values', {}).copy()
         
         if not user_variables and not requirements.get('required_variables'):
-            print("  ⚠️  No specific values provided. Please provide details for better results.\n")
+            print("    No specific values provided. Please provide details for better results.\n")
         
         # Ask for additional required variables
         required_vars = requirements.get('required_variables', [])
@@ -936,12 +936,12 @@ Return:
                         user_variables[var] = value
                         break
                     else:
-                        print(f"    ⚠️  This field is required. Please provide a value.")
+                        print(f"      This field is required. Please provide a value.")
         
         # Ask for optional configurations
         optional_configs = requirements.get('optional_configs', [])
         if optional_configs:
-            print("\n📝 Optional configurations (press Enter to skip):\n")
+            print("\n Optional configurations (press Enter to skip):\n")
             for config in optional_configs:
                 value = input(f"  {config} [optional]: ").strip()
                 if value:
@@ -949,12 +949,12 @@ Return:
         
         # Validate that we have at least some variables
         if not user_variables:
-            print("\n  ⚠️  WARNING: No specific values provided!")
+            print("\n    WARNING: No specific values provided!")
             print("  The generated code will be generic and may not meet your needs.")
             print("  Consider providing specific names, regions, or configurations.\n")
         else:
-            print(f"\n  ✓ Total variables collected: {len(user_variables)}")
-            print("\n  📦 Your configuration:")
+            print(f"\n   Total variables collected: {len(user_variables)}")
+            print("\n  Your configuration:")
             for key, value in user_variables.items():
                 print(f"    • {key}: {value}")
             print()
@@ -964,7 +964,7 @@ Return:
     def generate_terraform_code(self, user_query: str) -> Dict:
         """Complete pipeline from query to final code with strict variable enforcement"""
         print("\n" + "="*70)
-        print("🚀 TERRAFORM IaC GENERATION PIPELINE")
+        print(" TERRAFORM IaC GENERATION PIPELINE")
         print("="*70)
         
         # Layer 1: Query Understanding
@@ -974,7 +974,7 @@ Return:
         variables = self.collect_user_variables(requirements)
         
         if not variables:
-            print("\n⚠️  Proceeding with generic code generation...")
+            print("\n  Proceeding with generic code generation...")
             print("Consider re-running with specific values for better results.\n")
         
         # Layer 3: Multi-Strategy Retrieval
@@ -1029,12 +1029,12 @@ Return:
                        variable_tracker: VariableTracker):
         """Print final results with detailed variable analysis"""
         print("\n" + "="*70)
-        print("📄 GENERATED TERRAFORM CODE")
+        print(" GENERATED TERRAFORM CODE")
         print("="*70)
         print(terraform_code)
         
         print("\n" + "="*70)
-        print("🔍 VARIABLE USAGE VERIFICATION")
+        print(" VARIABLE USAGE VERIFICATION")
         print("="*70)
         
         if variables:
@@ -1044,18 +1044,18 @@ Return:
             
             unused = variable_tracker.get_unused_variables()
             if unused:
-                print(f"\n⚠️  CRITICAL WARNING: {len(unused)} variable(s) NOT used in code!")
+                print(f"\n  CRITICAL WARNING: {len(unused)} variable(s) NOT used in code!")
                 print("\nMissing variables:")
                 for var_name, var_value in unused.items():
                     print(f"  ✗ {var_name} = '{var_value}'")
-                print("\n⚠️  Please manually add these values to the generated code.")
+                print("\n  Please manually add these values to the generated code.")
             else:
-                print(f"\n✅ SUCCESS: All {len(variables)} variables properly incorporated!")
+                print(f"\n SUCCESS: All {len(variables)} variables properly incorporated!")
         else:
-            print("\n⚠️  No variables were provided - code is generic")
+            print("\n  No variables were provided - code is generic")
         
         print("\n" + "="*70)
-        print("📊 VALIDATION SUMMARY")
+        print(" VALIDATION SUMMARY")
         print("="*70)
         
         for agent_name, result in validation_results.items():
@@ -1074,14 +1074,14 @@ Return:
                     print(f"    • {suggestion}")
         
         print("\n" + "="*70)
-        print("📚 RETRIEVED CONTEXT USED")
+        print(" RETRIEVED CONTEXT USED")
         print("="*70)
-        print(f"  ✓ Used {len(context)} reference documents")
+        print(f"   Used {len(context)} reference documents")
         for i, ctx in enumerate(context[:3]):
             print(f"  {i+1}. {ctx.strategy.value.upper()} (Score: {ctx.score:.2f})")
         
         print("\n" + "="*70)
-        print("✅ PIPELINE COMPLETE")
+        print(" PIPELINE COMPLETE")
         print("="*70)
 
 
@@ -1094,14 +1094,14 @@ def main():
     PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
     
     if not PINECONE_API_KEY or not PINECONE_ENVIRONMENT:
-        print("❌ Error: PINECONE_API_KEY and PINECONE_ENVIRONMENT must be set")
+        print(" Error: PINECONE_API_KEY and PINECONE_ENVIRONMENT must be set")
         return
     
     # Initialize Gemini client
     try:
         gemini_client = genai.Client()
     except Exception as e:
-        print(f"❌ Error initializing Gemini client: {e}")
+        print(f" Error initializing Gemini client: {e}")
         print("Make sure GEMINI_API_KEY environment variable is set")
         return
     
@@ -1110,10 +1110,10 @@ def main():
         vector_store = PineconeIndex(
             PINECONE_API_KEY, 
             PINECONE_ENVIRONMENT, 
-            index_name="iac-terraform-v3"
+            index_name="terraform-aws-docs"
         )
     except Exception as e:
-        print(f"❌ Error connecting to Pinecone: {e}")
+        print(f" Error connecting to Pinecone: {e}")
         return
     
     # Initialize RAG system
@@ -1125,23 +1125,23 @@ def main():
     
     # Get user query
     print("="*70)
-    print("🎯 TERRAFORM INFRASTRUCTURE CODE GENERATOR")
+    print(" TERRAFORM INFRASTRUCTURE CODE GENERATOR")
     print("="*70)
-    print("\n💡 Tips for best results:")
+    print("\n Tips for best results:")
     print("  • Be specific with names (e.g., 'my-prod-bucket' not 'a bucket')")
     print("  • Include regions (e.g., 'us-east-1', 'eu-west-2')")
     print("  • Mention sizes/types (e.g., 't2.micro', '100GB')")
     print("  • Specify configurations (e.g., 'with encryption', 'public access')")
-    print("\n📝 Examples:")
+    print("\n Examples:")
     print("  • 'Create an S3 bucket named data-lake-prod in us-west-2 with versioning'")
     print("  • 'Deploy an EC2 instance named web-server type t2.micro in us-east-1'")
     print("  • 'Create RDS MySQL database named myapp-db in eu-central-1'")
     print()
     
-    user_query = input("📝 Describe the infrastructure you want to create:\n> ")
+    user_query = input(" Describe the infrastructure you want to create:\n> ")
     
     if not user_query.strip():
-        print("❌ Error: Query cannot be empty")
+        print(" Error: Query cannot be empty")
         return
     
     # Generate Terraform code
@@ -1154,7 +1154,7 @@ def main():
     with open(filename, "w") as f:
         f.write(result['terraform_code'])
     
-    print(f"\n💾 Terraform code saved to: {filename}")
+    print(f"\n Terraform code saved to: {filename}")
     
     # Save metadata
     metadata_filename = f"terraform_metadata_{timestamp}.json"
@@ -1181,12 +1181,12 @@ def main():
     with open(metadata_filename, "w") as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"📋 Metadata saved to: {metadata_filename}")
+    print(f" Metadata saved to: {metadata_filename}")
     
     # Final recommendations
     print("\n" + "="*70)
     if result['unused_variables']:
-        print("⚠️  ACTION REQUIRED:")
+        print("  ACTION REQUIRED:")
         print(f"  {len(result['unused_variables'])} variable(s) are missing from the code")
         print(f"  Please review {filename} and manually add:")
         for var in result['unused_variables']:
@@ -1194,16 +1194,23 @@ def main():
         print(f"\n  These values must be added for the code to work correctly!")
     else:
         if result['variables']:
-            print("✅ ALL VARIABLES SUCCESSFULLY INCORPORATED!")
+            print(" ALL VARIABLES SUCCESSFULLY INCORPORATED!")
             print(f"  All {len(result['variables'])} user-provided values are in the code")
         else:
-            print("⚠️  GENERIC CODE GENERATED")
+            print("  GENERIC CODE GENERATED")
             print("  No specific values were provided")
             print("  Consider re-running with specific names and configurations")
     
     print("="*70)
-    print(f"\n🎉 Generation complete! Check {filename} for your Terraform code.")
+    print(f"\n Generation complete! Check {filename} for your Terraform code.")
 
+
+class MCP_call_class():
+    def __init__(self):
+        pass
+
+    def main(self):
+        main()
 
 if __name__ == "__main__":
     main()
