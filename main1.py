@@ -38,10 +38,333 @@ class ValidationResult:
     score: float
 
 
+@dataclass
+class ValidationIssue:
+    """Represents a validation issue found in user input"""
+    field: str
+    original_value: str
+    issue_type: str
+    severity: str  # 'error', 'warning', 'info'
+    message: str
+    suggested_correction: Optional[str] = None
+
+
+@dataclass
+class CorrectionResult:
+    """Result of input correction"""
+    corrected_variables: Dict
+    issues: List[ValidationIssue]
+    auto_corrected: List[str]
+    needs_confirmation: List[ValidationIssue]
+
+
+class LLMInputValidator:
+    """
+    Uses Gemini LLM to intelligently validate and auto-correct user inputs
+    """
+    
+    # AWS knowledge base for the LLM
+    AWS_KNOWLEDGE = """
+# AWS Resource Validation Rules
+
+## S3 Bucket Configuration
+- **Bucket Names**: Must be 3-63 characters, lowercase, alphanumeric with hyphens
+- **ACL Values (CRITICAL)**: 
+  * Valid: private, public-read, public-read-write, aws-exec-read, authenticated-read, bucket-owner-read, bucket-owner-full-control, log-delivery-write
+  * Invalid: yes, no, true, false, public, readonly (These WILL cause AWS to FAIL)
+- **Storage Classes**: STANDARD, REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER, DEEP_ARCHIVE, GLACIER_IR
+- **Versioning**: true or false (accepts: yes/no, enabled/disabled, converts to true/false)
+
+## EC2 Configuration
+- **Instance Types**: t2.micro, t2.small, t3.micro, t3.small, m5.large, c5.large, etc.
+- **Tenancy**: default, dedicated, host
+- **Regions**: us-east-1, us-west-2, eu-west-1, ap-southeast-1, etc. (Format: region-direction-number)
+
+## EBS Volumes
+- **Volume Types**: gp2, gp3, io1, io2, st1, sc1, standard
+
+## RDS Database
+- **Engines**: mysql, postgres/postgresql, mariadb, oracle-se2, sqlserver-ex, sqlserver-web
+- **Instance Classes**: db.t2.micro, db.t3.small, db.m5.large, db.r5.xlarge (must start with 'db.')
+
+## VPC Networking
+- **CIDR Format**: x.x.x.x/x (e.g., 10.0.0.0/16, 192.168.0.0/24)
+- **Valid IP ranges**: 0-255 per octet, mask 0-32
+
+## Boolean Values
+- Terraform requires: true or false
+- Accepted for conversion: yes/no, enabled/disabled, on/off, 1/0
+
+## Common Mistakes to Watch For
+1. Using "yes/no" instead of "true/false" for booleans
+2. Using descriptive names for ACL (e.g., "yes", "public") instead of AWS constants
+3. Misspelling regions (e.g., "us-east1" instead of "us-east-1")
+4. Missing "db." prefix for RDS instance classes
+5. Invalid characters in bucket names (uppercase, special chars)
+6. Wrong format for CIDR blocks
+"""
+    
+    def __init__(self, gemini_client: genai.Client, model_name: str):
+        self.gemini_client = gemini_client
+        self.model_name = model_name
+        self.issues: List[ValidationIssue] = []
+    
+    def validate_and_correct(self, variables: Dict, resource_type: str) -> CorrectionResult:
+        """Main validation method using LLM"""
+        self.issues = []
+        
+        print("\n" + "="*70)
+        print("🔍 VALIDATING INPUT VARIABLES (AI-Powered)")
+        print("="*70)
+        
+        if not variables:
+            print("\n  No variables to validate.\n")
+            return CorrectionResult(
+                corrected_variables={},
+                issues=[],
+                auto_corrected=[],
+                needs_confirmation=[]
+            )
+        
+        # Use LLM to validate all variables at once
+        validation_result = self._llm_validate_all_variables(variables, resource_type)
+        
+        corrected_variables = validation_result.get('corrected_variables', variables.copy())
+        auto_corrected_fields = []
+        needs_confirmation = []
+        
+        # Process validation results
+        for field_name, field_validation in validation_result.get('fields', {}).items():
+            is_valid = field_validation.get('is_valid', True)
+            severity = field_validation.get('severity', 'info')
+            original_value = variables.get(field_name, '')
+            corrected_value = field_validation.get('corrected_value', original_value)
+            issue_message = field_validation.get('message', '')
+            
+            if not is_valid:
+                issue = ValidationIssue(
+                    field=field_name,
+                    original_value=str(original_value),
+                    issue_type=field_validation.get('issue_type', 'validation_error'),
+                    severity=severity,
+                    message=issue_message,
+                    suggested_correction=str(corrected_value) if corrected_value != original_value else None
+                )
+                self.issues.append(issue)
+                
+                # Determine if auto-correct or needs confirmation
+                auto_correct_confidence = field_validation.get('auto_correct_confidence', 0.0)
+                
+                if auto_correct_confidence >= 0.8:
+                    auto_corrected_fields.append(field_name)
+                    corrected_variables[field_name] = corrected_value
+                    
+                    if severity == 'error':
+                        print(f"\n❌ CRITICAL ERROR in '{field_name}':")
+                        print(f"   {issue_message}")
+                        print(f"   → Auto-corrected: '{original_value}' → '{corrected_value}'\n")
+                    else:
+                        print(f"  ✓ Auto-corrected '{field_name}': '{original_value}' → '{corrected_value}'")
+                else:
+                    needs_confirmation.append(issue)
+                    corrected_variables[field_name] = corrected_value
+                    print(f"  ⚠️  '{field_name}': '{original_value}' → '{corrected_value}' (needs confirmation)")
+            else:
+                # Value is valid but might be normalized
+                if corrected_value != original_value:
+                    auto_corrected_fields.append(field_name)
+                    corrected_variables[field_name] = corrected_value
+                    print(f"  ✓ Normalized '{field_name}': '{original_value}' → '{corrected_value}'")
+        
+        # Print summary
+        has_critical_errors = any(issue.severity == 'error' for issue in self.issues)
+        
+        print(f"\n{'='*70}")
+        print(f"  Total issues found: {len(self.issues)}")
+        print(f"  Auto-corrected: {len(auto_corrected_fields)}")
+        print(f"  Needs confirmation: {len(needs_confirmation)}")
+        
+        if has_critical_errors:
+            print(f"\n  ❌ CRITICAL ERRORS DETECTED!")
+            print(f"  These values WILL cause AWS to fail if not corrected.")
+        
+        print(f"{'='*70}\n")
+        
+        return CorrectionResult(
+            corrected_variables=corrected_variables,
+            issues=self.issues,
+            auto_corrected=auto_corrected_fields,
+            needs_confirmation=needs_confirmation
+        )
+    
+    def _llm_validate_all_variables(self, variables: Dict, resource_type: str) -> Dict:
+        """Use LLM to validate all variables intelligently"""
+        print("\n  🤖 Running AI validation...\n")
+        
+        variables_str = json.dumps(variables, indent=2)
+        
+        prompt = f"""You are an AWS Terraform expert validator. Analyze these user-provided variables for a {resource_type} resource.
+
+USER VARIABLES:
+{variables_str}
+
+VALIDATION RULES:
+{self.AWS_KNOWLEDGE}
+
+TASKS:
+1. Validate EACH variable against AWS requirements
+2. Identify invalid values that will cause AWS to FAIL
+3. Provide corrected values with high accuracy
+4. Assign severity: 'error' (will cause AWS failure), 'warning' (suboptimal), 'info' (style)
+5. Rate your confidence in auto-correction (0.0-1.0)
+
+CRITICAL FOCUS AREAS:
+- S3 ACL values: "yes", "no", "true", "false" are INVALID → suggest valid ACL
+- Boolean values: Convert yes/no/enabled/disabled to true/false
+- AWS regions: Check format and spelling
+- Instance types: Verify they exist
+- Naming conventions: Ensure AWS compliance
+
+Respond ONLY with JSON (no markdown, no preamble):
+{{
+  "corrected_variables": {{
+    "field_name": "corrected_value"
+  }},
+  "fields": {{
+    "field_name": {{
+      "is_valid": true/false,
+      "original_value": "value",
+      "corrected_value": "corrected_value",
+      "issue_type": "invalid_acl|invalid_region|invalid_boolean|naming_issue|etc",
+      "severity": "error|warning|info",
+      "message": "Clear explanation of what's wrong and why it will fail",
+      "auto_correct_confidence": 0.0-1.0,
+      "reasoning": "Why this correction was made"
+    }}
+  }},
+  "overall_assessment": "Brief summary"
+}}
+"""
+        
+        try:
+            response = self.gemini_client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
+            
+            # Extract JSON from response
+            response_text = response.text.strip()
+            response_text = re.sub(r'^```json\s*', '', response_text)
+            response_text = re.sub(r'^```\s*', '', response_text)
+            response_text = re.sub(r'\s*```$', '', response_text)
+            
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                
+                print(f"  ✓ AI validation complete")
+                if 'overall_assessment' in result:
+                    print(f"  Assessment: {result['overall_assessment']}\n")
+                
+                return result
+            else:
+                print(f"  ⚠️  Could not parse AI response, using original values")
+                return {
+                    'corrected_variables': variables.copy(),
+                    'fields': {},
+                    'overall_assessment': 'Validation skipped'
+                }
+        
+        except Exception as e:
+            print(f"  ⚠️  AI validation error: {str(e)}")
+            return {
+                'corrected_variables': variables.copy(),
+                'fields': {},
+                'overall_assessment': f'Validation error: {str(e)}'
+            }
+    
+    def get_confirmation_from_user(self, needs_confirmation: List[ValidationIssue]) -> Dict:
+        """Interactively confirm corrections with user"""
+        if not needs_confirmation:
+            return {}
+        
+        print("\n" + "="*70)
+        print("  CORRECTIONS NEED YOUR CONFIRMATION")
+        print("="*70)
+        
+        confirmed_corrections = {}
+        
+        for issue in needs_confirmation:
+            print(f"\n  Field: {issue.field}")
+            print(f"  Original: {issue.original_value}")
+            print(f"  Suggested: {issue.suggested_correction}")
+            print(f"  Reason: {issue.message}")
+            
+            while True:
+                choice = input(f"\n  Accept suggestion? (y/n/edit): ").lower().strip()
+                
+                if choice == 'y':
+                    confirmed_corrections[issue.field] = issue.suggested_correction
+                    print(f"  ✓ Using: {issue.suggested_correction}")
+                    break
+                elif choice == 'n':
+                    confirmed_corrections[issue.field] = issue.original_value
+                    print(f"  ✓ Keeping original: {issue.original_value}")
+                    break
+                elif choice == 'edit':
+                    new_value = input(f"  Enter new value for {issue.field}: ").strip()
+                    if new_value:
+                        confirmed_corrections[issue.field] = new_value
+                        print(f"  ✓ Using custom value: {new_value}")
+                        break
+                else:
+                    print("  Please enter 'y', 'n', or 'edit'")
+        
+        return confirmed_corrections
+    
+    def print_validation_report(self, result: CorrectionResult):
+        """Print detailed validation report"""
+        print("\n" + "="*70)
+        print("  AI VALIDATION REPORT")
+        print("="*70)
+        
+        if not result.issues:
+            print("\n  ✓ All inputs are valid!")
+            return
+        
+        # Group by severity
+        errors = [i for i in result.issues if i.severity == 'error']
+        warnings = [i for i in result.issues if i.severity == 'warning']
+        info = [i for i in result.issues if i.severity == 'info']
+        
+        if errors:
+            print(f"\n  ❌ ERRORS ({len(errors)}):")
+            for issue in errors:
+                print(f"\n    Field: {issue.field}")
+                print(f"    {issue.message}")
+                if issue.suggested_correction:
+                    print(f"    → Corrected to: {issue.suggested_correction}")
+        
+        if warnings:
+            print(f"\n  ⚠️  WARNINGS ({len(warnings)}):")
+            for issue in warnings:
+                print(f"    • {issue.field}: {issue.message}")
+                if issue.suggested_correction:
+                    print(f"      → Suggested: {issue.suggested_correction}")
+        
+        if info:
+            print(f"\n  ℹ️  INFO ({len(info)}):")
+            for issue in info:
+                print(f"    • {issue.field}: {issue.message}")
+        
+        if result.auto_corrected:
+            print(f"\n  Auto-corrected fields: {', '.join(result.auto_corrected)}")
+        
+        print("\n" + "="*70)
+
+
 class PineconeIndex():
-    """
-    Pinecone Index class for vector store operations.
-    """
+    """Pinecone Index class for vector store operations."""
     def __init__(self, PINECONE_API_KEY, PINECONE_ENVIRONMENT, index_name):
         self.pinecone = Pinecone(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
         self.index = self.pinecone.Index(index_name)
@@ -54,16 +377,13 @@ class PineconeIndex():
             vector=query_vector, 
             top_k=top_k, 
             include_metadata=True,
-            
         )
+        print("Retrived Documents:",results)
         return results
 
 
 class MultiStrategyRetrieval():
-    """
-    Layer 3: Multi-Strategy Retrieval System
-    Implements semantic, structural, and code-based search strategies
-    """
+    """Layer 3: Multi-Strategy Retrieval System"""
     def __init__(self, pinecone_index: PineconeIndex, gemini_client: genai.Client, model_name: str):
         self.pinecone_index = pinecone_index
         self.gemini_client = gemini_client
@@ -87,7 +407,6 @@ class MultiStrategyRetrieval():
     def structural_search(self, resource_type: str, top_k: int = 3) -> List[RetrievalResult]:
         """Search for structural templates and module patterns"""
         print("    Performing structural search...")
-        
         query = f"terraform module structure {resource_type} best practices"
         results = self.pinecone_index.retrieve_index(query, top_k=top_k, namespace="__default__")
         
@@ -104,7 +423,6 @@ class MultiStrategyRetrieval():
     def code_search(self, query: str, top_k: int = 3) -> List[RetrievalResult]:
         """Search for similar code implementations"""
         print("   Performing code search...")
-        
         code_query = f"terraform code implementation {query}"
         results = self.pinecone_index.retrieve_index(code_query, top_k=top_k, namespace="__default__")
         
@@ -120,7 +438,7 @@ class MultiStrategyRetrieval():
     
     def multi_strategy_retrieve(self, query: str, resource_type: str) -> List[RetrievalResult]:
         """Combine all search strategies"""
-        print("\n LAYER 3: Multi-Strategy Retrieval\n")
+        print("\n📚 LAYER 3: Multi-Strategy Retrieval\n")
         
         semantic_results = self.semantic_search(query, top_k=5)
         structural_results = self.structural_search(resource_type, top_k=3)
@@ -133,10 +451,7 @@ class MultiStrategyRetrieval():
 
 
 class IntelligentReranker():
-    """
-    Layer 4: Intelligent Re-ranking & Validation
-    Re-ranks results based on relevance, security, and context
-    """
+    """Layer 4: Intelligent Re-ranking & Validation"""
     def __init__(self, gemini_client: genai.Client, model_name: str):
         self.gemini_client = gemini_client
         self.model_name = model_name
@@ -208,7 +523,7 @@ Respond with JSON array of scores (0-1) for each document:
     
     def rerank_and_validate(self, query: str, results: List[RetrievalResult]) -> List[RetrievalResult]:
         """Complete re-ranking and validation pipeline"""
-        print("\n LAYER 4: Intelligent Re-ranking & Validation\n")
+        print("\n🎯 LAYER 4: Intelligent Re-ranking & Validation\n")
         
         results = self.relevance_scoring(query, results)
         results = self.security_validation(results)
@@ -225,9 +540,7 @@ Respond with JSON array of scores (0-1) for each document:
 
 
 class VariableTracker():
-    """
-    Tracks user variables and ensures they are properly used in generated code
-    """
+    """Tracks user variables and ensures they are properly used in generated code"""
     def __init__(self):
         self.variables = {}
         self.variable_usage_map = {}
@@ -235,7 +548,6 @@ class VariableTracker():
     def add_variables(self, variables: Dict):
         """Add variables to track"""
         self.variables.update(variables)
-        # Initialize usage map
         for key, value in variables.items():
             self.variable_usage_map[key] = {
                 'value': value,
@@ -251,11 +563,9 @@ class VariableTracker():
         for var_name, var_info in self.variable_usage_map.items():
             var_value = str(var_info['value'])
             
-            # Check for exact value match
             if var_value in code:
                 used.append(var_name)
                 self.variable_usage_map[var_name]['used'] = True
-                # Find locations
                 lines = code.split('\n')
                 for i, line in enumerate(lines, 1):
                     if var_value in line:
@@ -281,10 +591,7 @@ class VariableTracker():
 
 
 class MultiAgentGeneration():
-    """
-    Layer 5: Multi-Agent Generation System
-    Specialized agents for different aspects of code generation
-    """
+    """Layer 5: Multi-Agent Generation System"""
     def __init__(self, gemini_client: genai.Client, model_name: str):
         self.gemini_client = gemini_client
         self.model_name = model_name
@@ -314,31 +621,12 @@ class MultiAgentGeneration():
         
         return '\n'.join(clean_lines).strip()
     
-    def validate_terraform_syntax(self, code: str) -> Tuple[bool, List[str]]:
-        """Validate basic Terraform syntax"""
-        issues = []
-        
-        open_braces = code.count('{')
-        close_braces = code.count('}')
-        if open_braces != close_braces:
-            issues.append(f"Unbalanced braces: {open_braces} opening, {close_braces} closing")
-        
-        if 'resource' in code and not re.search(r'resource\s+"[\w-]+"', code):
-            issues.append("Invalid resource syntax")
-        
-        quotes = code.count('"')
-        if quotes % 2 != 0:
-            issues.append("Unclosed string quotes detected")
-        
-        return len(issues) == 0, issues
-    
     def create_variable_injection_prompt(self, variables: Dict) -> str:
         """Create detailed instructions for variable injection"""
         instructions = []
         instructions.append("MANDATORY VARIABLE USAGE - EVERY VALUE MUST APPEAR IN CODE:\n")
         
         for var_name, var_value in variables.items():
-            # Determine likely Terraform argument name
             tf_arg = var_name.lower().replace(' ', '_').replace('-', '_')
             instructions.append(f"• {var_name} = \"{var_value}\"")
             instructions.append(f"  → MUST use in code as: {tf_arg} = \"{var_value}\"")
@@ -351,7 +639,6 @@ class MultiAgentGeneration():
         """Main generator agent with multi-attempt variable enforcement"""
         print("   Generator Agent: Creating Terraform code...")
         
-        # Initialize variable tracker
         self.variable_tracker.add_variables(variables)
         
         context_text = self._format_context(context)
@@ -379,9 +666,6 @@ CRITICAL RULES - FAILURE TO FOLLOW WILL REQUIRE REGENERATION:
 6. All brackets must be balanced and closed
 7. Include brief inline comments (using #) only for complex logic
 
-VERIFICATION CHECKLIST - Before returning code, verify:
-{self._create_verification_checklist(variables)}
-
 Generate the complete Terraform code now:
 """
             
@@ -392,18 +676,15 @@ Generate the complete Terraform code now:
             
             terraform_code = self.extract_terraform_code(response.text)
             
-            # Check variable usage
             used_vars, unused_vars = self.variable_tracker.check_usage_in_code(terraform_code)
             
             if not unused_vars:
                 print(f"  ✓ All {len(used_vars)} variables successfully incorporated")
                 return terraform_code
             
-            # If variables are missing, regenerate with explicit injection
             if attempt < max_attempts - 1:
                 print(f"  ⚠️  Missing {len(unused_vars)} variable(s): {', '.join(unused_vars)}")
                 
-                # Create targeted fix prompt
                 unused_details = '\n'.join([f"  • {var} = \"{variables[var]}\"" for var in unused_vars])
                 
                 fix_prompt = f"""The following Terraform code is INCOMPLETE. It is MISSING required user values.
@@ -421,8 +702,6 @@ INSTRUCTIONS:
 4. Return ONLY the complete corrected Terraform code
 5. NO explanations, NO markdown
 
-EVERY missing value must appear EXACTLY as shown above in the corrected code.
-
 Corrected complete code:
 """
                 
@@ -432,25 +711,16 @@ Corrected complete code:
                 )
                 terraform_code = self.extract_terraform_code(fix_response.text)
         
-        # Final check after all attempts
         used_vars, unused_vars = self.variable_tracker.check_usage_in_code(terraform_code)
         if unused_vars:
             print(f"    WARNING: {len(unused_vars)} variable(s) still missing after {max_attempts} attempts")
         
         return terraform_code
     
-    def _create_verification_checklist(self, variables: Dict) -> str:
-        """Create a checklist for the LLM to verify"""
-        checklist = []
-        for var_name, var_value in variables.items():
-            checklist.append(f"  [ ] The exact string \"{var_value}\" appears in the code")
-        return '\n'.join(checklist)
-    
     def validator_agent(self, terraform_code: str, variables: Dict) -> ValidationResult:
         """Validator agent with comprehensive variable checking"""
         print("   Validator Agent: Checking correctness...")
         
-        # Check variable usage
         used_vars, unused_vars = self.variable_tracker.check_usage_in_code(terraform_code)
         
         issues = []
@@ -480,8 +750,7 @@ Respond in JSON format:
     "is_valid": true/false,
     "issues": ["list of all issues including missing user values"],
     "suggestions": ["improvements"],
-    "score": 0.0-1.0,
-    "all_user_values_present": true/false
+    "score": 0.0-1.0
 }}
 """
         
@@ -494,8 +763,6 @@ Respond in JSON format:
             json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
             if json_match:
                 result_data = json.loads(json_match.group())
-                
-                # Merge issues
                 all_issues = issues + result_data.get('issues', [])
                 
                 return ValidationResult(
@@ -604,7 +871,7 @@ Respond in JSON format:
     def generate_with_agents(self, query: str, context: List[RetrievalResult], 
                             variables: Dict) -> Tuple[str, Dict[str, ValidationResult], VariableTracker]:
         """Orchestrate all agents and return tracker"""
-        print("\n LAYER 5: Multi-Agent Generation\n")
+        print("\n🤖 LAYER 5: Multi-Agent Generation\n")
         
         terraform_code = self.generator_agent(query, context, variables, max_attempts=3)
         
@@ -625,9 +892,7 @@ Respond in JSON format:
 
 
 class ReflectionQA():
-    """
-    Layer 6: Reflection & Quality Assurance with strict variable enforcement
-    """
+    """Layer 6: Reflection & Quality Assurance"""
     def __init__(self, gemini_client: genai.Client, model_name: str):
         self.gemini_client = gemini_client
         self.model_name = model_name
@@ -644,7 +909,6 @@ class ReflectionQA():
             all_issues.extend(result.issues)
             all_suggestions.extend(result.suggestions)
         
-        # Get unused variables from tracker
         unused_vars = variable_tracker.get_unused_variables()
         
         prompt = f"""Critically review this Terraform code for quality and completeness:
@@ -660,9 +924,6 @@ Variable Usage Status:
 Known Issues:
 {json.dumps(all_issues, indent=2)}
 
-Suggestions:
-{json.dumps(all_suggestions[:5], indent=2)}
-
 Provide comprehensive critique in JSON format:
 {{
     "overall_quality": 0.0-1.0,
@@ -670,8 +931,7 @@ Provide comprehensive critique in JSON format:
     "weaknesses": ["list of weaknesses"],
     "must_fix": ["CRITICAL issues that must be fixed"],
     "improvements": ["suggested improvements"],
-    "all_variables_used": true/false,
-    "missing_variables": ["list of variable names not in code"]
+    "all_variables_used": true/false
 }}
 """
         
@@ -685,17 +945,14 @@ Provide comprehensive critique in JSON format:
             if json_match:
                 critique = json.loads(json_match.group())
                 
-                # Add missing variables to must_fix
                 if unused_vars:
                     critique['all_variables_used'] = False
-                    critique['missing_variables'] = list(unused_vars.keys())
                     for var_name, var_value in unused_vars.items():
                         critique['must_fix'] = critique.get('must_fix', []) + [
                             f"CRITICAL: Add user value {var_name} = '{var_value}' to the code"
                         ]
                 else:
                     critique['all_variables_used'] = True
-                    critique['missing_variables'] = []
                 
                 return critique
         except:
@@ -708,8 +965,7 @@ Provide comprehensive critique in JSON format:
             "weaknesses": [f"Missing variable: {k}" for k in unused_vars.keys()],
             "must_fix": [f"Add {k} = '{v}'" for k, v in unused_vars.items()],
             "improvements": [],
-            "all_variables_used": not has_unused,
-            "missing_variables": list(unused_vars.keys())
+            "all_variables_used": not has_unused
         }
     
     def iterative_refinement(self, terraform_code: str, critique: Dict, 
@@ -726,9 +982,6 @@ Provide comprehensive critique in JSON format:
         if not unused_vars:
             return terraform_code
         
-        context_text = self._format_context(context)
-        
-        # Create explicit instructions for each missing variable
         missing_var_instructions = []
         for var_name, var_value in unused_vars.items():
             missing_var_instructions.append(
@@ -743,20 +996,12 @@ INCOMPLETE CODE:
 MISSING VALUES (MUST ADD ALL OF THESE):
 {chr(10).join(missing_var_instructions)}
 
-ALL USER VALUES FOR REFERENCE:
-{json.dumps(variables, indent=2)}
-
-REFERENCE DOCUMENTATION:
-{context_text}
-
 INSTRUCTIONS:
 1. Identify which Terraform resource arguments need these values
 2. Add the EXACT values (not placeholders) to the code
 3. Maintain all existing code structure and other values
 4. Return ONLY the corrected Terraform code
-5. NO explanations, NO markdown, NO comments about changes
-
-VERIFICATION: Before returning, ensure EVERY value from "MISSING VALUES" appears in the code.
+5. NO explanations, NO markdown
 
 Corrected code with ALL user values:
 """
@@ -767,7 +1012,7 @@ Corrected code with ALL user values:
         )
         
         refined_code = re.sub(r'```(?:hcl|terraform|tf)?\n?', '', response.text)
-        refined_code = re.sub(r'```\n?$', '', refined_code).strip()
+        refined_code = re.sub(r'```\n?', '', refined_code).strip()
         
         return refined_code
     
@@ -775,65 +1020,51 @@ Corrected code with ALL user values:
                                context: List[RetrievalResult], variables: Dict, 
                                variable_tracker: VariableTracker,
                                max_iterations: int = 4) -> str:
-        """Complete reflection and QA pipeline with aggressive variable enforcement"""
-        print("\n LAYER 6: Reflection & Quality Assurance\n")
+        """Complete reflection and QA pipeline"""
+        print("\n✨ LAYER 6: Reflection & Quality Assurance\n")
         
         current_code = terraform_code
         
         for iteration in range(max_iterations):
             print(f"   Iteration {iteration + 1}/{max_iterations}")
             
-            # Update tracker with current code
             variable_tracker.variable_usage_map = {}
             variable_tracker.add_variables(variables)
             used_vars, unused_vars = variable_tracker.check_usage_in_code(current_code)
             
-            # Self-critique
             critique = self.self_critique(current_code, validation_results, variables, variable_tracker)
             
             print(f"    Variables used: {len(used_vars)}/{len(variables)}")
             if unused_vars:
                 print(f"    Missing: {', '.join(unused_vars)}")
             
-            # Check if all variables are used and quality is good
             if (critique.get('all_variables_used', False) and 
                 critique.get('overall_quality', 0) >= 0.85 and
                 not critique.get('must_fix')):
-                print(f"   All variables incorporated (quality: {critique.get('overall_quality')})")
+                print(f"   ✓ All variables incorporated (quality: {critique.get('overall_quality')})")
                 break
             
-            # If variables are missing or quality is low, refine
             if unused_vars or critique.get('must_fix'):
                 current_code = self.iterative_refinement(
                     current_code, critique, context, variables, variable_tracker
                 )
         
-        # Final verification
         variable_tracker.variable_usage_map = {}
         variable_tracker.add_variables(variables)
         used_vars, unused_vars = variable_tracker.check_usage_in_code(current_code)
         
         if unused_vars:
-            print(f"    WARNING: {len(unused_vars)} variable(s) still missing after {max_iterations} iterations")
+            print(f"    ⚠️ WARNING: {len(unused_vars)} variable(s) still missing")
         else:
-            print(f"   SUCCESS: All {len(variables)} variables properly incorporated")
+            print(f"   ✅ SUCCESS: All {len(variables)} variables incorporated")
         
         print(f"   Reflection complete\n")
         
         return current_code
-    
-    def _format_context(self, context: List[RetrievalResult]) -> str:
-        """Format context"""
-        formatted = []
-        for i, result in enumerate(context):
-            formatted.append(f"Reference {i+1}:\n{result.content[:500]}...")
-        return "\n\n".join(formatted)
 
 
 class RAGSystem():
-    """
-    Complete RAG System with all layers integrated and strict variable enforcement
-    """
+    """Complete RAG System with AI-powered input validation"""
     def __init__(self, pinecone_index: PineconeIndex, gemini_client: genai.Client, model_name: str = "gemini-2.5-flash"):
         self.model_name = model_name
         self.pinecone_index = pinecone_index 
@@ -843,10 +1074,11 @@ class RAGSystem():
         self.reranker = IntelligentReranker(gemini_client, model_name)
         self.agents = MultiAgentGeneration(gemini_client, model_name)
         self.reflection = ReflectionQA(gemini_client, model_name)
+        self.validator = LLMInputValidator(gemini_client, model_name)
 
     def query_understanding_agent(self, user_query: str) -> Dict:
         """Layer 1: Query Understanding with value extraction"""
-        print("\n LAYER 1: Query Understanding\n")
+        print("\n🔎 LAYER 1: Query Understanding\n")
         print("  Analyzing your request...\n")
         
         prompt = f"""Analyze this Terraform infrastructure request and extract ALL specific details:
@@ -858,31 +1090,14 @@ Extract:
 2. EVERY specific value mentioned (names, IDs, regions, sizes, counts, etc.)
 3. Additional variables that should be asked from the user
 
-Be thorough - extract EVERY concrete value the user provided.
-
 Respond in JSON format:
 {{
     "resource_type": "primary AWS resource type",
     "user_provided_values": {{
-        "descriptive_key": "exact_value_from_query",
-        "another_key": "another_value"
+        "descriptive_key": "exact_value_from_query"
     }},
     "required_variables": ["list", "of", "additional", "needed", "info"],
     "optional_configs": ["list", "of", "optional", "settings"]
-}}
-
-Example:
-If user says: "Create an S3 bucket named my-app-bucket in us-west-2 with versioning"
-Return:
-{{
-    "resource_type": "S3 bucket",
-    "user_provided_values": {{
-        "bucket_name": "my-app-bucket",
-        "region": "us-west-2",
-        "versioning": "enabled"
-    }},
-    "required_variables": [],
-    "optional_configs": ["encryption", "lifecycle_rules"]
 }}
 """
         response = self.gemini_client.models.generate_content(
@@ -897,7 +1112,6 @@ Return:
                 print(f"   Resource type: {requirements.get('resource_type')}")
                 print(f"   Values extracted: {len(requirements.get('user_provided_values', {}))}")
                 
-                # Display extracted values
                 if requirements.get('user_provided_values'):
                     print("\n   Extracted from your query:")
                     for key, value in requirements.get('user_provided_values', {}).items():
@@ -916,10 +1130,9 @@ Return:
         }
     
     def collect_user_variables(self, requirements: Dict) -> Dict:
-        """Layer 2: Variable Collection with validation"""
-        print(" LAYER 2: Collecting Required Information\n")
+        """Layer 2: Variable Collection & validation"""
+        print("LAYER 2: Collecting Required Information\n")
         
-        # Start with values already extracted
         user_variables = requirements.get('user_provided_values', {}).copy()
         
         if not user_variables and not requirements.get('required_variables'):
@@ -947,35 +1160,58 @@ Return:
                 if value:
                     user_variables[config] = value
         
-        # Validate that we have at least some variables
         if not user_variables:
             print("\n    WARNING: No specific values provided!")
-            print("  The generated code will be generic and may not meet your needs.")
-            print("  Consider providing specific names, regions, or configurations.\n")
-        else:
-            print(f"\n   Total variables collected: {len(user_variables)}")
-            print("\n  Your configuration:")
-            for key, value in user_variables.items():
-                print(f"    • {key}: {value}")
-            print()
+            print("  The generated code will be generic and may not meet your needs.\n")
+            return user_variables
+        
+        print(f"\n   Total variables collected: {len(user_variables)}")
+        print("\n  Your configuration:")
+        for key, value in user_variables.items():
+            print(f"    • {key}: {value}")
+        print()
+        
+        # === AI-POWERED VALIDATION ===
+        correction_result = self.validator.validate_and_correct(
+            user_variables, 
+            requirements.get('resource_type', 'infrastructure')
+        )
+        
+        # Print detailed validation report
+        self.validator.print_validation_report(correction_result)
+        
+        # Get user confirmation for uncertain corrections
+        if correction_result.needs_confirmation:
+            confirmations = self.validator.get_confirmation_from_user(
+                correction_result.needs_confirmation
+            )
+            correction_result.corrected_variables.update(confirmations)
+        
+        # Use AI-corrected variables
+        user_variables = correction_result.corrected_variables
+        
+        print("\n  ✅ Variables after AI validation:")
+        for key, value in user_variables.items():
+            print(f"    • {key}: {value}")
+        print()
         
         return user_variables
     
     def generate_terraform_code(self, user_query: str) -> Dict:
-        """Complete pipeline from query to final code with strict variable enforcement"""
+        """Complete pipeline from query to final code"""
         print("\n" + "="*70)
-        print(" TERRAFORM IaC GENERATION PIPELINE")
+        print("🚀 TERRAFORM IaC GENERATION PIPELINE")
         print("="*70)
         
         # Layer 1: Query Understanding
         requirements = self.query_understanding_agent(user_query)
         
-        # Layer 2: Variable Collection
+        # Layer 2: Variable Collection with AI Validation
         variables = self.collect_user_variables(requirements)
         
         if not variables:
             print("\n  Proceeding with generic code generation...")
-            print("Consider re-running with specific values for better results.\n")
+            print("  Consider re-running with specific values for better results.\n")
         
         # Layer 3: Multi-Strategy Retrieval
         retrieval_results = self.retrieval.multi_strategy_retrieve(
@@ -986,14 +1222,14 @@ Return:
         # Layer 4: Re-ranking & Validation
         best_context = self.reranker.rerank_and_validate(user_query, retrieval_results)
         
-        # Layer 5: Multi-Agent Generation with variable tracking
+        # Layer 5: Multi-Agent Generation
         terraform_code, validation_results, variable_tracker = self.agents.generate_with_agents(
             user_query, 
             best_context, 
             variables
         )
         
-        # Layer 6: Reflection & QA with aggressive variable enforcement
+        # Layer 6: Reflection & QA
         final_code = self.reflection.reflection_qa_pipeline(
             terraform_code,
             validation_results,
@@ -1003,7 +1239,7 @@ Return:
             max_iterations=4
         )
         
-        # Final comprehensive check
+        # Final verification
         final_tracker = VariableTracker()
         final_tracker.add_variables(variables)
         used_vars, unused_vars = final_tracker.check_usage_in_code(final_code)
@@ -1027,14 +1263,14 @@ Return:
                        context: List[RetrievalResult],
                        variables: Dict,
                        variable_tracker: VariableTracker):
-        """Print final results with detailed variable analysis"""
+        """Print final results"""
         print("\n" + "="*70)
-        print(" GENERATED TERRAFORM CODE")
+        print("📄 GENERATED TERRAFORM CODE")
         print("="*70)
         print(terraform_code)
         
         print("\n" + "="*70)
-        print(" VARIABLE USAGE VERIFICATION")
+        print("✅ VARIABLE USAGE VERIFICATION")
         print("="*70)
         
         if variables:
@@ -1044,18 +1280,18 @@ Return:
             
             unused = variable_tracker.get_unused_variables()
             if unused:
-                print(f"\n  CRITICAL WARNING: {len(unused)} variable(s) NOT used in code!")
+                print(f"\n  ⚠️ CRITICAL WARNING: {len(unused)} variable(s) NOT used in code!")
                 print("\nMissing variables:")
                 for var_name, var_value in unused.items():
                     print(f"  ✗ {var_name} = '{var_value}'")
                 print("\n  Please manually add these values to the generated code.")
             else:
-                print(f"\n SUCCESS: All {len(variables)} variables properly incorporated!")
+                print(f"\n ✅ SUCCESS: All {len(variables)} variables properly incorporated!")
         else:
             print("\n  No variables were provided - code is generic")
         
         print("\n" + "="*70)
-        print(" VALIDATION SUMMARY")
+        print("📊 VALIDATION SUMMARY")
         print("="*70)
         
         for agent_name, result in validation_results.items():
@@ -1066,46 +1302,40 @@ Return:
                 print(f"  Issues ({len(result.issues)}):")
                 for issue in result.issues[:3]:
                     print(f"    • {issue}")
-                if len(result.issues) > 3:
-                    print(f"    ... and {len(result.issues) - 3} more")
             if result.suggestions:
                 print(f"  Suggestions ({len(result.suggestions)}):")
                 for suggestion in result.suggestions[:2]:
                     print(f"    • {suggestion}")
         
         print("\n" + "="*70)
-        print(" RETRIEVED CONTEXT USED")
+        print("📚 RETRIEVED CONTEXT USED")
         print("="*70)
         print(f"   Used {len(context)} reference documents")
         for i, ctx in enumerate(context[:3]):
             print(f"  {i+1}. {ctx.strategy.value.upper()} (Score: {ctx.score:.2f})")
         
         print("\n" + "="*70)
-        print(" PIPELINE COMPLETE")
+        print("🎉 PIPELINE COMPLETE")
         print("="*70)
 
 
 def main():
     """Main execution function"""
-    print("🔧 Initializing Terraform IaC RAG System...\n")
+    print("🔧 Initializing Terraform IaC RAG System with AI Validation...\n")
     
-    # Load environment variables
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
     PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
     
     if not PINECONE_API_KEY or not PINECONE_ENVIRONMENT:
-        print(" Error: PINECONE_API_KEY and PINECONE_ENVIRONMENT must be set")
+        print("❌ Error: PINECONE_API_KEY and PINECONE_ENVIRONMENT must be set")
         return
     
-    # Initialize Gemini client
     try:
         gemini_client = genai.Client()
     except Exception as e:
-        print(f" Error initializing Gemini client: {e}")
-        print("Make sure GEMINI_API_KEY environment variable is set")
+        print(f"❌ Error initializing Gemini client: {e}")
         return
     
-    # Initialize vector store
     try:
         vector_store = PineconeIndex(
             PINECONE_API_KEY, 
@@ -1113,50 +1343,43 @@ def main():
             index_name="terraform-aws-docs"
         )
     except Exception as e:
-        print(f" Error connecting to Pinecone: {e}")
+        print(f"❌ Error connecting to Pinecone: {e}")
         return
     
-    # Initialize RAG system
     rag_system = RAGSystem(
         pinecone_index=vector_store,
         gemini_client=gemini_client,
         model_name="gemini-2.5-flash"
     )
     
-    # Get user query
     print("="*70)
-    print(" TERRAFORM INFRASTRUCTURE CODE GENERATOR")
+    print("🏗️  TERRAFORM INFRASTRUCTURE CODE GENERATOR (AI-Validated)")
     print("="*70)
-    print("\n Tips for best results:")
-    print("  • Be specific with names (e.g., 'my-prod-bucket' not 'a bucket')")
-    print("  • Include regions (e.g., 'us-east-1', 'eu-west-2')")
-    print("  • Mention sizes/types (e.g., 't2.micro', '100GB')")
-    print("  • Specify configurations (e.g., 'with encryption', 'public access')")
-    print("\n Examples:")
-    print("  • 'Create an S3 bucket named data-lake-prod in us-west-2 with versioning'")
+    print("\n💡 Tips for best results:")
+    print("  • Be specific with names")
+    print("  • Include regions")
+    print("  • Mention configurations")
+    print("\n📝 Examples:")
+    print("  • 'Create an S3 bucket named data-prod in us-west-2 with ACL public-read'")
     print("  • 'Deploy an EC2 instance named web-server type t2.micro in us-east-1'")
-    print("  • 'Create RDS MySQL database named myapp-db in eu-central-1'")
     print()
     
-    user_query = input(" Describe the infrastructure you want to create:\n> ")
+    user_query = input("💬 Describe the infrastructure you want to create:\n> ")
     
     if not user_query.strip():
-        print(" Error: Query cannot be empty")
+        print("❌ Error: Query cannot be empty")
         return
     
-    # Generate Terraform code
     result = rag_system.generate_terraform_code(user_query)
     
-    # Automatically save to file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"terraform_code_{timestamp}.tf"
     
     with open(filename, "w") as f:
         f.write(result['terraform_code'])
     
-    print(f"\n Terraform code saved to: {filename}")
+    print(f"\n💾 Terraform code saved to: {filename}")
     
-    # Save metadata
     metadata_filename = f"terraform_metadata_{timestamp}.json"
     metadata = {
         'query': user_query,
@@ -1169,40 +1392,30 @@ def main():
             agent: {
                 'is_valid': val.is_valid,
                 'score': val.score,
-                'issues_count': len(val.issues),
-                'suggestions_count': len(val.suggestions)
+                'issues_count': len(val.issues)
             }
             for agent, val in result['validation_results'].items()
         },
-        'retrieved_documents_count': len(result['retrieved_context']),
         'timestamp': timestamp
     }
     
     with open(metadata_filename, "w") as f:
         json.dump(metadata, f, indent=2)
     
-    print(f" Metadata saved to: {metadata_filename}")
+    print(f"📋 Metadata saved to: {metadata_filename}")
     
-    # Final recommendations
     print("\n" + "="*70)
     if result['unused_variables']:
-        print("  ACTION REQUIRED:")
-        print(f"  {len(result['unused_variables'])} variable(s) are missing from the code")
-        print(f"  Please review {filename} and manually add:")
-        for var in result['unused_variables']:
-            print(f"    • {var} = '{result['variables'][var]}'")
-        print(f"\n  These values must be added for the code to work correctly!")
+        print("⚠️  ACTION REQUIRED:")
+        print(f"  {len(result['unused_variables'])} variable(s) missing from code")
     else:
         if result['variables']:
-            print(" ALL VARIABLES SUCCESSFULLY INCORPORATED!")
-            print(f"  All {len(result['variables'])} user-provided values are in the code")
+            print("✅ ALL VARIABLES SUCCESSFULLY INCORPORATED!")
         else:
-            print("  GENERIC CODE GENERATED")
-            print("  No specific values were provided")
-            print("  Consider re-running with specific names and configurations")
+            print("📝 GENERIC CODE GENERATED")
     
     print("="*70)
-    print(f"\n Generation complete! Check {filename} for your Terraform code.")
+    print(f"\n🎉 Generation complete! Check {filename}")
 
 
 class MCP_call_class():
@@ -1211,6 +1424,7 @@ class MCP_call_class():
 
     def main(self):
         main()
+
 
 if __name__ == "__main__":
     main()
