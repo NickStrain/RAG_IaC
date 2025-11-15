@@ -226,7 +226,7 @@ CRITICAL FOCUS AREAS:
 - Naming conventions: Ensure AWS compliance
 
 Respond ONLY with JSON (no markdown, no preamble):
-{{
+{{ino
   "corrected_variables": {{
     "field_name": "corrected_value"
   }},
